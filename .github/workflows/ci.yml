@@ -47,7 +47,7 @@ jobs:
       - name: nftables template parses
         run: |
           sudo apt-get install -y nftables
-          tests/nft_check.sh
+          sudo tests/nft_check.sh
 
   install:
     # A real first install on a fresh Ubuntu 24.04 VM, then a few commands and the uninstaller.
@@ -66,7 +66,7 @@ jobs:
           sudo wgctl site add nas http://192.168.1.10:5000
           sudo wgctl add ci-phone --sites nas --admin
           sudo wgctl render
-          sudo env CF_API_TOKEN=dummy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          sudo env CF_API_TOKEN=dummyTokenForValidationOnly0123456789abc caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           sudo wg show
           sudo wgctl server
           sudo wgctl-update --help

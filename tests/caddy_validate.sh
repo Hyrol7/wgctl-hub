@@ -15,5 +15,5 @@ w site add nas http://192.168.1.10:5000 >/dev/null
 w site add pve https://192.168.1.11:8006 >/dev/null
 w add phone --sites nas,pve --admin >/dev/null
 w panel on >/dev/null
-CF_API_TOKEN=dummy "$CADDY" validate --adapter caddyfile --config "$R/etc/caddy/Caddyfile"
+CF_API_TOKEN=dummyTokenForValidationOnly0123456789abc "$CADDY" validate --adapter caddyfile --config "$R/etc/caddy/Caddyfile"
 echo "Caddyfile OK"

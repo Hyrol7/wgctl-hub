@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The nftables template from install.sh must parse (nft -c needs no root for a dry check).
+# The nftables template from install.sh must parse (run as root: nft -c needs CAP_NET_ADMIN even for a dry check).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d)
