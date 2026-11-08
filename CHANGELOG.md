@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- Panel login asks only for the password and a code (there is one account anyway).
+- Keys with "all sites" (and locations with "all sites") can now lose a single site: untick them on the site page, or `wgctl deny KEY SITE`. New sites still reach them automatically; `grant` gives the site back. Public sites stay open to everyone.
+- Overview map: sites hosted on the VPS itself have their own "This VPS" planet; device labels no longer overlap site labels.
+
 ## 1.0.0 — first public release
 
 A WireGuard + Caddy hub that gives each device access to chosen services behind your routers, without opening ports at home.

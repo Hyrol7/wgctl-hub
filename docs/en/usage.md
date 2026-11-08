@@ -17,7 +17,7 @@ sudo wgctl show iphone-olena
 | Command | What it does |
 |---|---|
 | `wgctl conf NAME` / `wgctl qr NAME` | print the saved config / QR again |
-| `wgctl grant NAME site…` / `wgctl deny NAME site…` | add or remove sites |
+| `wgctl grant NAME site…` / `wgctl deny NAME site…` | add or remove sites; for a key with `*` (all sites) `deny` closes just that site, new sites still come automatically |
 | `wgctl set NAME --sites nas,photos` | replace the site list (`*` = all, `none`) |
 | `wgctl set NAME --expires 2026-12-31` | expiry date; the key is disabled after it |
 | `wgctl extend NAME` | restart the 60-day inactivity countdown; for a guest: `--hours 2` |
@@ -41,7 +41,7 @@ sudo wgctl site set nas --backend http://192.168.1.10:5001
 sudo wgctl site rm nas
 ```
 
-The site is `https://nas.<domain>`. A backend is always an IPv4 address (no host names, so DNS tricks cannot point a site somewhere else): inside a location's networks, a device with a key, or the VPS itself (`http://127.0.0.1:3000`). On the VPS only ports from 1024 are allowed, except Caddy's admin API (2019), the panel (8090) and the TCP service ports (2201–2999).
+The site is `https://nas.<domain>`. A backend is always an IPv4 address (no host names, so DNS tricks cannot point a site somewhere else): inside a location's networks, a device with a key, or the VPS itself (`http://127.0.0.1:3000`). Sites on the VPS itself need no location: on the overview map they sit on their own "This VPS" planet. On the VPS only ports from 1024 are allowed, except Caddy's admin API (2019), the panel (8090) and the TCP service ports (2201–2999).
 
 A key without access to a site sees a friendly "no access" page; a site whose backend is down shows "Site temporarily unavailable".
 

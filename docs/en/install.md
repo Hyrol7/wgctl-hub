@@ -39,7 +39,7 @@ What it does, step by step (it asks before each one):
 3. **Hub settings:** `wgctl init` asks for the domain, public IP, WireGuard port, VPN subnet, time zone, language and panel name; writes `/etc/wgctl/config.toml`, generates the server key in `/etc/wireguard/wg0.conf` and the main `/etc/caddy/Caddyfile`.
 4. **Firewall:** writes `/etc/nftables.conf` from [templates/nftables.conf.in](../../templates/nftables.conf.in) — inbound SSH, WireGuard, HTTPS on `wg0` for clients and locations, HTTPS on the public interface from Cloudflare only; no forwarding. The previous file is kept as `/etc/nftables.conf.before-wgctl`. The rules are checked with `nft -c` before they are applied.
 5. **Services:** `wg-quick@wg0`, Caddy (once the token is in place), timers `wgctl-monitor` (every minute), `wgctl-geo` (weekly), `wgctl-report` (08:00).
-6. **Panel account:** `vpnadmin setup` — login, password (12+ characters) and an authenticator app (TOTP). Save the backup codes it prints.
+6. **Panel account:** `vpnadmin setup` — a password (12+ characters) and an authenticator app (TOTP); the panel asks only for the password and a code. Save the backup codes it prints.
 
 If you skipped the token: put it into `/etc/caddy/cloudflare.env` as `CF_API_TOKEN=...`, then
 

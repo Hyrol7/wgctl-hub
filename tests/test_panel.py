@@ -47,7 +47,7 @@ def test_login_requires_same_origin(panel):
 
 
 def test_non_ascii_login_is_401_not_500(panel):
-    st, *_ = Client(panel).req("POST", "/login", {"user": "адмін", "password": "x", "code": "1"})
+    st, *_ = Client(panel).req("POST", "/login", {"password": "пароль", "code": "1"})
     assert st == 401
 
 
@@ -196,3 +196,23 @@ def test_location_reissue_and_delete_need_code(panel):
     assert panel.hub.state()["locations"]["home"]["pubkey"] != pub
     st, loc, *_ = c.req("POST", "/l/home", {"csrf": tok, "act": "rm", "code": panel.code()})
     assert "home" not in panel.hub.state()["locations"]
+
+
+def test_login_is_password_and_code_only(panel):
+    st, _, t, _ = Client(panel).req("GET", "/login")
+    assert 'for="u"' not in t and 'name="password"' in t and 'name="code"' in t
+    c = Client(panel)
+    st, loc, _, _ = c.login()                      # no user field at all
+    assert st == 303 and loc == "/" and c.cookie
+
+
+def test_site_page_can_close_site_for_all_sites_key(panel):
+    panel.hub.run("add", "mac", "--sites", "*")
+    c, tok = logged_in(panel)
+    st, _, t, _ = c.req("GET", "/s/nas")
+    assert 'value="mac" checked' in t and 'value="mac" checked disabled' not in t
+    cand = re.search(r'name="cand" value="([^"]*)"', t).group(1)
+    assert "mac" in cand.split(",")
+    c.req("POST", "/s/nas", {"csrf": tok, "act": "access", "cand": cand, "who": ["phone"]})
+    assert panel.hub.state()["clients"]["mac"]["except"] == ["nas"]
+    assert panel.hub.state()["clients"]["phone"]["sites"] == ["nas"]

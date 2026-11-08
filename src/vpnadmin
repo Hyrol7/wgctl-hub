@@ -31,7 +31,7 @@ import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 
 def _load_config():
@@ -230,7 +230,7 @@ def cli_setup(force):
     if os.path.exists(AUTH_FILE) and not force:
         sys.exit(T("Обліковий запис уже є ({0}). Повторно: vpnadmin setup --force", AUTH_FILE))
     os.makedirs(AUTH_DIR, mode=0o700, exist_ok=True)
-    user = input(T("Логін [admin]: ")).strip() or "admin"
+    user = "admin"                       # one account: login is password + code, the name only labels the TOTP entry
     pw = ask_password()
     secret = enroll_totp(user)
     codes, recs = make_backup_codes()
@@ -751,7 +751,7 @@ class H(http.server.BaseHTTPRequestHandler):
                         return self.send(503, T("Обліковий запис не створено: vpnadmin setup"), "text/plain; charset=utf-8")
                     # scrypt always runs: response time does not reveal whether the login was right
                     pw_ok = check_pw(auth["pw"], str(f.get("password", ""))[:1024])
-                    ok = same(f.get("user", ""), auth["user"]) and pw_ok
+                    ok = pw_ok
                     code = str(f.get("code", ""))
                     used_backup = False
                     if ok and not totp_check(auth, code):
@@ -778,8 +778,8 @@ class H(http.server.BaseHTTPRequestHandler):
                     event(T("Невдала спроба входу в панель з {0}", ip), "warning", "🔐")
                 elif n == FAIL_LIMIT:
                     event(T("Вхід із {0} заблоковано на 15 хв: {1} невдалих спроб", ip, n), "critical", "⛔")
-                err = T("Невірний логін, пароль або код.")
-        body = T("<div class=\"login\"><span class=\"logo\">{0}</span><div class=\"panel\">\n<h2>Вхід у панель</h2>{1}\n<form method=\"post\" action=\"/login\" autocomplete=\"on\">\n<label class=\"f\" for=\"u\">Логін</label><input type=\"text\" id=\"u\" name=\"user\" autocomplete=\"username\" required>\n<label class=\"f\" for=\"p\">Пароль</label><input type=\"password\" id=\"p\" name=\"password\" autocomplete=\"current-password\" required>\n<label class=\"f\" for=\"c\">Код із застосунку або резервний код</label>\n<input type=\"text\" id=\"c\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" placeholder=\"123456\" required>\n<div class=\"row\"><button class=\"btn pri\">Увійти</button></div></form>\n<p class=\"small muted\">Телефону з кодами немає під рукою? Введіть резервний код (xxxx-xxxx) або скиньте TOTP через SSH: vpnadmin reset-totp.</p></div></div>", e(BRAND), f'<div class="note bad">{e(err)}</div>' if err else '')
+                err = T("Невірний пароль або код.")
+        body = T("<div class=\"login\"><span class=\"logo\">{0}</span><div class=\"panel\">\n<h2>Вхід у панель</h2>{1}\n<form method=\"post\" action=\"/login\" autocomplete=\"on\">\n<input type=\"text\" name=\"user\" value=\"{2}\" autocomplete=\"username\" hidden>\n<label class=\"f\" for=\"p\">Пароль</label><input type=\"password\" id=\"p\" name=\"password\" autocomplete=\"current-password\" required autofocus>\n<label class=\"f\" for=\"c\">Код із застосунку або резервний код</label>\n<input type=\"text\" id=\"c\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" placeholder=\"123456\" required>\n<div class=\"row\"><button class=\"btn pri\">Увійти</button></div></form>\n<p class=\"small muted\">Телефону з кодами немає під рукою? Введіть резервний код (xxxx-xxxx) або скиньте TOTP через SSH: vpnadmin reset-totp.</p></div></div>", e(BRAND), f'<div class="note bad">{e(err)}</div>' if err else '', "admin")
         page = T("<!doctype html><html lang=\"uk\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"color-scheme\" content=\"light dark\"><title>Вхід · {0}</title><link rel=\"icon\" href=\"/favicon.svg?v={1}\">\n<link rel=\"stylesheet\" href=\"/static/app.css?v={2}\"></head><body>{3}</body></html>", e(BRAND), ASSET_V['/favicon.svg'], ASSET_V['/static/app.css'], body)
         self.send(200 if not err else 401, page)
 
@@ -894,13 +894,15 @@ class H(http.server.BaseHTTPRequestHandler):
                         f'{e(x["text"])}</div></div>')
         return '<div class="evs">' + "".join(rows) + "</div>"
 
-    def toggles(self, sites, current):
+    def toggles(self, sites, current, exc=None):
         cur = current if isinstance(current, list) else []
         out = [T("<label class=\"tog all\"><input type=\"checkbox\" name=\"all\" value=\"1\" id=\"all-sites\"{0}><span>Усі сайти, включно з майбутніми</span></label>", " checked" if current == "*" else "")]
         for st in sites:
             out.append(f'<label class="tog"><input class="site-cb" type="checkbox" name="site" value="{st["name"]}"'
                        f'{" checked" if st["name"] in cur else ""}><span>{e(st["name"])}</span></label>')
         tail = "" if sites else T("<p class=\"small muted\">Сайтів ще немає. <a href=\"/sites\">Додати сайт</a></p>")
+        if current == "*" and exc:
+            tail += T("<p class=\"small muted\">Крім: {0}. Повернути сайт можна на його сторінці.</p>", e(", ".join(exc)))
         return f'<div class="togs">{"".join(out)}</div>{tail}'
 
     @staticmethod
@@ -1113,11 +1115,12 @@ class H(http.server.BaseHTTPRequestHandler):
                    T("роутер ще не підключався") if not l.get("handshake") else T("немає зв'язку"))
             planets.append({"t": l.get("title") or n, "s": sub, "cls": cls, "items": topo["locations"].get(n, []),
                             "href": f"/l/{n}"})
-        other = topo["vps"] + topo["other"]
-        if other:
-            bad = any(x["ok"] is False for x in other)
-            planets.append({"t": T("Інші сайти"), "s": T("на VPS і поза мережею"), "cls": "bad" if bad else "ok", "items": other,
-                            "href": "/sites"})
+        # sites whose backend is the VPS itself (127.0.0.1:port) get their own planet; no location is needed for them
+        for items, title, sub in ((topo["vps"], T("Цей VPS"), T("сайти на самому сервері")),
+                                  (topo["other"], T("Інші сайти"), T("поза мережею"))):
+            if items:
+                bad = any(x["ok"] is False for x in items)
+                planets.append({"t": title, "s": sub, "cls": "bad" if bad else "ok", "items": items, "href": "/sites"})
         return planets, topo["devices"]
 
     @staticmethod
@@ -1163,6 +1166,7 @@ class H(http.server.BaseHTTPRequestHandler):
         # planets on the inner orbit: the first two at the top left and top right, the rest at the bottom
         slots = [202, 338, 90, 250, 290, 140, 40]
         placed = []
+        boxes = []                                  # label boxes already drawn: device labels avoid them
         for i, pl in enumerate(planets):
             a = math.radians(slots[i % len(slots)])
             placed.append((pl, hx + IRX * math.cos(a), hy + IRY * math.sin(a)))
@@ -1191,8 +1195,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 else:
                     anc = "end" if math.cos(a) < 0 else "start"
                     dx, dy = (-15 if anc == "end" else 15), 5
-                # above the planet only the name (ms in the hint), at the side also the state
-                info = "" if (up and it["ok"] is not False) or it.get("agg") else self.item_info(it)
+                # above the planet only the name (state by colour, details in the hint), at the side also the state
+                info = "" if up or it.get("agg") else self.item_info(it)
+                lw = len(cut(it["name"], 14)) * 7.6 + len(info) * 6.4
+                lx = mx + dx - (lw / 2 if anc == "middle" else lw if anc == "end" else 0)
+                boxes.append((lx, my + dy - 14, lx + lw, my + dy + 4))
+                boxes.append((mx - 10, my - 10, mx + 10, my + 10))
                 g.append(f'<line class="tether" x1="{x:.0f}" y1="{y:.0f}" x2="{mx:.0f}" y2="{my:.0f}"/>'
                          f'<a href="{item_href(it)}"><title>{e(it["name"] + ": " + (self.item_info(it) or T("ще не перевірено")))}</title>{self.item_mark(it, mx, my)}'
                          f'<text class="mn" x="{mx + dx:.0f}" y="{my + dy:.0f}" text-anchor="{anc}">{e(cut(it["name"], 14))}'
@@ -1200,6 +1208,9 @@ class H(http.server.BaseHTTPRequestHandler):
             if len(pl["items"]) > 6:
                 g.append(T("<text class=\"ps\" x=\"{0:.0f}\" y=\"{1:.0f}\" text-anchor=\"middle\">і ще {2} на сторінці «Сайти»</text>", x, y + (150 if up else 98), len(pl["items"]) - 6))
             ty = y - 64 if up else y + 62
+            boxes.append((x - 40, y - 40, x + 40, y + 40))
+            pw = max(len(pl["t"]) * 9, len(pl["s"]) * 7)
+            boxes.append((x - pw / 2, ty - 16, x + pw / 2, ty + 22))
             g.append(f'<a href="{pl["href"]}"><title>{e(pl["t"])}</title><circle class="pl {pl["cls"]}" cx="{x:.0f}" cy="{y:.0f}" r="38"/>'
                      f'<circle class="dt {pl["cls"]}" cx="{x:.0f}" cy="{y:.0f}" r="7"/>'
                      f'<text class="pt" x="{x:.0f}" y="{ty:.0f}" text-anchor="middle">{e(pl["t"])}</text>'
@@ -1225,12 +1236,19 @@ class H(http.server.BaseHTTPRequestHandler):
             name = cut(d["name"], 18)
             names = ", ".join(cut(it["name"], 12) for it in d["sites"][:3]) + (" …" if len(d["sites"]) > 3 else "")
             sub = T("на пристрої: {0}", names) if d["sites"] else ""
-            # label width (roughly): if it would go past the edge of the map at the side, put it under the dot
-            need = max(len(name) * 8.6, len(sub) * 6.6) + 30
-            if (x + need > W - 6) if r_side else (x - need < 6):
-                tx, ty, anc = x, y + 34, "middle"
-            else:
-                tx, ty, anc = x + (22 if r_side else -22), y + 5, "start" if r_side else "end"
+            # label (rough width): beside the dot if it fits, else under or above it, wherever it hits no other label
+            w = max(len(name) * 8.6, len(sub) * 6.6)
+            hgt = 34 if sub else 18
+
+            def free(bx):
+                return (bx[0] >= 4 and bx[2] <= W - 4 and bx[1] >= 0 and bx[3] <= H
+                        and not any(bx[0] - 8 < b[2] and b[0] < bx[2] + 8 and bx[1] < b[3] and b[1] < bx[3] for b in boxes))
+            side = (x + 22, y - 9, x + 22 + w, y - 9 + hgt) if r_side else (x - 22 - w, y - 9, x - 22, y - 9 + hgt)
+            cands = [(side, (x + (22 if r_side else -22), y + 5, "start" if r_side else "end")),
+                     ((x - w / 2, y + 20, x + w / 2, y + 20 + hgt), (x, y + 34, "middle")),
+                     ((x - w / 2, y - 22 - hgt, x + w / 2, y - 22), (x, y - 26 - (17 if sub else 0), "middle"))]
+            bx, (tx, ty, anc) = next((c for c in cands if free(c[0])), cands[1])
+            boxes.append(bx)
             lab = (f'<text class="dn" x="{tx:.0f}" y="{ty:.0f}" text-anchor="{anc}">{e(name)}</text>'
                    if labels or cls in ("bad", "warn") else "")
             g = [f'<a href="/c/{d["name"]}"><title>{e(d["name"])}</title>{halo}<circle class="dt dv {cls}" cx="{x:.0f}" cy="{y:.0f}" r="9"/>{lab}</a>']
@@ -1417,7 +1435,7 @@ class H(http.server.BaseHTTPRequestHandler):
             else:
                 confh = T("<p class=\"muted\">Конфіг не збережено. Натисніть «Перевидати конфіг», щоб створити новий.</p>")
             parts.append(T("<section><h2>Конфіг</h2><div class=\"panel\">{0}</div></section>", confh))
-            parts.append(T("<section><h2>Сайти</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"sites\">\n{1}<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>", cs, self.toggles(sites, c['sites'])))
+            parts.append(T("<section><h2>Сайти</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"sites\">\n{1}<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>", cs, self.toggles(sites, c['sites'], c.get('except'))))
             if c.get("services"):
                 rows = "".join(f'<div class="ln"><span class="when"><a href="/t/{x["name"]}">{e(x["name"])}</a></span>'
                                f'<span class="mono muted">{e(x["name"])}.{DOMAIN}:{x["port"]}</span>'
@@ -1592,7 +1610,7 @@ class H(http.server.BaseHTTPRequestHandler):
                            self.code_field("lsc")))
         sites = wgj("site", "list")
         parts.append(T("<section><h2>Сайти для мережі локації</h2><div class=\"panel\"><p class=\"muted small\">Які сайти можуть відкривати пристрої в мережі локації без власного ключа. Потрібен NAT на роутері, див. документацію, розділ «Локації».</p><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"sites\">\n{1}<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>",
-                       cs, self.toggles(sites, l.get("sites") or [])))
+                       cs, self.toggles(sites, l.get("sites") or [], l.get("except"))))
         if l["managed"]:
             parts.append(T("<section><h2>Небезпечні дії</h2><div class=\"panel\"><p class=\"muted small\">Потрібен код із застосунку.</p>\n<form method=\"post\" class=\"row\">{0}{1}\n<button class=\"btn\" name=\"act\" value=\"reissue\" data-confirm=\"Створити нові ключі? Роутер утратить зв'язок, доки ви не налаштуєте на ньому новий конфіг.\">Нові ключі для роутера</button>\n<button class=\"btn danger\" name=\"act\" value=\"rm\" data-confirm=\"Видалити локацію {2}? Хаб утратить зв'язок з її мережами.\">Видалити локацію</button></form></div></section>",
                            cs, self.code_field("ldc"), e(l["title"])))
@@ -1838,11 +1856,12 @@ class H(http.server.BaseHTTPRequestHandler):
                        [("location", l) for l in status["locations"]]:
             pname = x["name"]
             allsites = x.get("sites") == "*"
+            locked = allsites and site.get("public")      # a public site is open to everyone anyway
             label = T("{0} (уся мережа)", x.get('title') or pname) if kind == "location" else pname
             togs.append(f'<label class="tog"><input type="checkbox" name="who" value="{pname}"'
-                        f'{" checked" if pname in site["access"] else ""}{" disabled" if allsites else ""}>'
+                        f'{" checked" if pname in site["access"] else ""}{" disabled" if locked else ""}>'
                         f'<span>{e(label)}{T(" · усі сайти") if allsites else ""}</span></label>')
-            if not allsites:
+            if not locked:
                 cands.append(pname)
         if site.get("public"):
             pub = (T("<div class=\"note warn\">Сайт бачить увесь інтернет через Cloudflare; права ключів на нього не діють. Захищає лише логін самого сайту.</div>"))
@@ -1850,11 +1869,13 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             pub = (T("<p class=\"muted small\">Публічний сайт відкривається з інтернету через Cloudflare. Потрібні власний логін і регулярні оновлення сервісу.</p>"))
             pact, plabel, pcls = "public_on", T("Зробити публічним"), "btn danger"
-        body = T("<section><h2>Доступ</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"access\">\n<input type=\"hidden\" name=\"cand\" value=\"{1}\"><div class=\"togs\">{2}</div>\n<p class=\"small muted\">Ключі з правом «усі сайти» змінюються на сторінці ключа.</p>\n<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>\n{3}\n<section><h2>Хто заходив <small>за 30 днів</small></h2>{4}</section>\n<section><h2>Публічний доступ</h2><div class=\"panel\">{5}<form method=\"post\" class=\"row\">{6}{7}\n<button class=\"{8}\" name=\"act\" value=\"{9}\">{10}</button></form></div></section>\n<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{11}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"sb\">Адреса сервісу</label><input type=\"text\" id=\"sb\" name=\"backend\" value=\"{12}\" required></div>\n<div><label class=\"f\" for=\"sn\">Примітка</label><input type=\"text\" id=\"sn\" name=\"note\" maxlength=\"80\" value=\"{13}\"></div></div>\n<label class=\"check\"><input type=\"checkbox\" name=\"insecure\" value=\"1\"{14}>Сервіс на HTTPS із самопідписаним сертифікатом</label>\n<label class=\"check\"><input type=\"checkbox\" name=\"upstream_host\" value=\"1\"{15}>Передавати сервісу його власну адресу</label>\n<label class=\"f\" for=\"slog\">Журнал звернень</label><select id=\"slog\" name=\"log\">{17}</select>\n<label class=\"f\" for=\"slsk\">Не записувати шляхи (через кому)</label><input type=\"text\" id=\"slsk\" name=\"log_skip\" maxlength=\"400\" placeholder=\"/s, /health\" value=\"{18}\">\n<p class=\"hint\">«Без шляху»: у журнал потрапляє лише перший сегмент адреси, напр. /hook/[hidden]. Секрети з адреси й параметрів запиту не записуються.</p>\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form>\n<div class=\"row\">{16}</div></div></section>", cs, ','.join(cands), ''.join(togs) or T("<p class=\"muted\">Ключів ще немає.</p>"), self.availability(f"/s/{name}", name), self.visits_block(self.site_visits(name)), pub, cs, self.code_field('pc'), pcls, pact, plabel, cs, e(site['backend']), e(site.get('note') or ''), ' checked' if site.get('insecure') else '', ' checked' if site.get('upstream_host') else '', self.bform(s, "delete", T("Видалити сайт"), "btn danger", T("Видалити {0}? Доступ до нього зникне в усіх.", site['host'])),
+        body = T("<section><h2>Доступ</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"access\">\n<input type=\"hidden\" name=\"cand\" value=\"{1}\"><div class=\"togs\">{2}</div>\n<p class=\"small muted\">{19}</p>\n<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>\n{3}\n<section><h2>Хто заходив <small>за 30 днів</small></h2>{4}</section>\n<section><h2>Публічний доступ</h2><div class=\"panel\">{5}<form method=\"post\" class=\"row\">{6}{7}\n<button class=\"{8}\" name=\"act\" value=\"{9}\">{10}</button></form></div></section>\n<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{11}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"sb\">Адреса сервісу</label><input type=\"text\" id=\"sb\" name=\"backend\" value=\"{12}\" required></div>\n<div><label class=\"f\" for=\"sn\">Примітка</label><input type=\"text\" id=\"sn\" name=\"note\" maxlength=\"80\" value=\"{13}\"></div></div>\n<label class=\"check\"><input type=\"checkbox\" name=\"insecure\" value=\"1\"{14}>Сервіс на HTTPS із самопідписаним сертифікатом</label>\n<label class=\"check\"><input type=\"checkbox\" name=\"upstream_host\" value=\"1\"{15}>Передавати сервісу його власну адресу</label>\n<label class=\"f\" for=\"slog\">Журнал звернень</label><select id=\"slog\" name=\"log\">{17}</select>\n<label class=\"f\" for=\"slsk\">Не записувати шляхи (через кому)</label><input type=\"text\" id=\"slsk\" name=\"log_skip\" maxlength=\"400\" placeholder=\"/s, /health\" value=\"{18}\">\n<p class=\"hint\">«Без шляху»: у журнал потрапляє лише перший сегмент адреси, напр. /hook/[hidden]. Секрети з адреси й параметрів запиту не записуються.</p>\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form>\n<div class=\"row\">{16}</div></div></section>", cs, ','.join(cands), ''.join(togs) or T("<p class=\"muted\">Ключів ще немає.</p>"), self.availability(f"/s/{name}", name), self.visits_block(self.site_visits(name)), pub, cs, self.code_field('pc'), pcls, pact, plabel, cs, e(site['backend']), e(site.get('note') or ''), ' checked' if site.get('insecure') else '', ' checked' if site.get('upstream_host') else '', self.bform(s, "delete", T("Видалити сайт"), "btn danger", T("Видалити {0}? Доступ до нього зникне в усіх.", site['host'])),
                  "".join(f'<option value="{v}"{" selected" if site.get("log", "full") == v else ""}>{e(t)}</option>'
                          for v, t in (("full", T("Повний")), ("hide-path", T("Без шляху (ховати секрети в адресі)")),
                                       ("off", T("Не писати")))),
-                 e(", ".join(site.get("log_skip") or [])))
+                 e(", ".join(site.get("log_skip") or [])),
+                 T("Публічний сайт відкритий з інтернету, тому ключі з правом «усі сайти» тут не обмежити.") if site.get("public") else
+                 T("Ключам із правом «усі сайти» тут можна закрити саме цей сайт; нові сайти вони й далі отримуватимуть."))
         return self.layout(s, site["host"], hero, body, "sites", state)
 
     # -- notifications
@@ -2041,7 +2062,7 @@ class H(http.server.BaseHTTPRequestHandler):
                         if not check_pw(auth["pw"], str(f.get("old", ""))):
                             self.flash(s, "bad", T("Поточний пароль невірний"))
                         elif len(p1) < 12 or len(p1) > 1024 or p1 != p2 or p1 == auth["user"]:
-                            self.flash(s, "bad", T("Новий пароль: від 12 символів, не логін, обидва поля однакові"))
+                            self.flash(s, "bad", T("Новий пароль: від 12 символів, обидва поля однакові"))
                         else:
                             auth["pw"], auth["pw_changed"] = make_pw(p1), int(time.time())
                             auth["epoch"] = auth.get("epoch", 1) + 1

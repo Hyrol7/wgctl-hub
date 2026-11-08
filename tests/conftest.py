@@ -163,7 +163,7 @@ class Client:
         return r.status, r.getheader("Location"), text, r
 
     def login(self, code=None, password=PASSWORD):
-        return self.req("POST", "/login", {"user": "admin", "password": password, "code": code or self.p.code()})
+        return self.req("POST", "/login", {"password": password, "code": code or self.p.code()})
 
     @staticmethod
     def csrf(text):

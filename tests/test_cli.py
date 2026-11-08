@@ -266,3 +266,22 @@ def test_location_network_cannot_take_vps_network(hub_en):
     hub_en.env["WGCTL_HOST_NETS"] = "10.0.0.0/24"
     r = hub_en.run("location", "add", "x", "--networks", "10.0.0.0/16", ok=False)
     assert r.returncode != 0 and "VPS" in r.stderr + r.stdout
+
+
+def test_all_sites_key_can_lose_one_site(hub_en):
+    hub_en.run("location", "add", "home", "--networks", "192.168.1.0/24")
+    hub_en.run("site", "add", "nas", "http://192.168.1.10:5000")
+    hub_en.run("site", "add", "cam", "http://192.168.1.11:80")
+    hub_en.run("add", "mac", "--sites", "*")
+    hub_en.run("deny", "mac", "cam")
+    assert hub_en.state()["clients"]["mac"]["except"] == ["cam"]
+    sites = {s["name"]: s["access"] for s in json.loads(hub_en.run("site", "list", "--json").stdout)}
+    assert sites["cam"] == [] and sites["nas"] == ["mac"]
+    hub_en.run("site", "add", "wiki", "http://192.168.1.12:80")          # new sites still come automatically
+    sites = {s["name"]: s["access"] for s in json.loads(hub_en.run("site", "list", "--json").stdout)}
+    assert sites["wiki"] == ["mac"]
+    hub_en.run("set", "mac", "--sites", "*")                              # saving "*" again keeps the exception
+    assert hub_en.state()["clients"]["mac"]["except"] == ["cam"]
+    assert "except cam" in hub_en.run("show", "mac").stdout.replace(",", "")
+    hub_en.run("grant", "mac", "cam")
+    assert "except" not in hub_en.state()["clients"]["mac"]

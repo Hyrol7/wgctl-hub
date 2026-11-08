@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # ---- paths (WGCTL_ROOT is for tests only) -----------------------------------
 ROOT = os.environ.get("WGCTL_ROOT", "")
@@ -446,7 +446,10 @@ def principal(st, name):
 
 
 def has_site(p, site):
-    return p.get("sites") == "*" or site in (p.get("sites") or [])
+    """Explicit list, or "*" (all sites, including future ones) minus the sites excluded one by one."""
+    if p.get("sites") == "*":
+        return site not in (p.get("except") or [])
+    return site in (p.get("sites") or [])
 
 
 def idle_from(c):
@@ -759,7 +762,7 @@ def client_view(name, c, peers, rdays=ROTATE_DEFAULT):
         "rx": (p or {}).get("rx", 0), "tx": (p or {}).get("tx", 0),
         "created": c["created"], "note": c.get("note", ""), "expires": c.get("expires"),
         "autorevoke": c.get("autorevoke", True), "autorevoke_in_days": left,
-        "admin": c.get("admin", False), "sites": c.get("sites", []),
+        "admin": c.get("admin", False), "sites": c.get("sites", []), "except": c.get("except", []),
         "conf_file": f"{CONF_DIR}/{name}.conf" if c.get("conf") else None,
         "suspect": c.get("suspect", ""), "suspect_at": c.get("suspect_at", 0),
         "endpoints": c.get("endpoints", [])[-50:], "revoked_at": c.get("revoked_at", 0),
@@ -779,8 +782,10 @@ def table(rows):
         print("  ".join(str(v).ljust(widths[i]) for i, v in enumerate(r)).rstrip())
 
 
-def sites_str(v):
-    return T("усі") if v == "*" else (", ".join(v) if v else "-")
+def sites_str(v, exc=None):
+    if v == "*":
+        return T("усі") + (T(", крім {0}", ", ".join(exc)) if exc else "")
+    return ", ".join(v) if v else "-"
 
 
 # ---- clients ----------------------------------------------------------------
@@ -917,7 +922,7 @@ def cmd_list(a):
         g = v["geo"]
         where = " ".join(x for x in (g.get("cc", ""), g.get("city", "")) if x) or (g.get("ip") or "-")
         rows.append((v["name"], v["ip"], status, link, ago(v["last_seen"]), where, traffic,
-                     sites_str(v["sites"]), warn, v["note"]))
+                     sites_str(v["sites"], v.get("except")), warn, v["note"]))
     table(rows)
 
 
@@ -937,7 +942,7 @@ def cmd_show(a):
     print(T("Останнє підкл.:   {0} ({1})", fmt_ts(v['last_seen']), ago(v['last_seen'])))
     print(T("Звідки:           {0}", v['endpoint'] or '-'))
     print(T("Трафік (з/до):    {0} / {1}", human(v['rx']), human(v['tx'])))
-    print(T("Сайти:            {0}", sites_str(v['sites'])))
+    print(T("Сайти:            {0}", sites_str(v["sites"], v.get("except"))))
     print(T("Створено:         {0}", fmt_ts(v['created'])))
     print(T("Термін дії:       {0}", v['expires'] or T("без обмеження")))
     if v["status"] == "active":
@@ -1117,7 +1122,10 @@ def cmd_set(a):
             c["admin"] = onoff(a.admin)
             msgs.append(T("адмін: {0}", T("так") if c['admin'] else T("ні")))
         if a.sites is not None:
-            c["sites"] = parse_sites(st, a.sites)
+            new = parse_sites(st, a.sites)
+            if not (new == "*" and c.get("sites") == "*"):
+                c.pop("except", None)              # a new list replaces the exceptions too
+            c["sites"] = new
             msgs.append(T("сайти: {0}", sites_str(c['sites'])))
         if a.phone is not None:
             given = True
@@ -1156,19 +1164,20 @@ def cmd_grant(a, revoke=False):
         for s in a.sites:
             get_site(st, s)
         cur = p.get("sites") or []
-        if revoke:
-            if cur == "*":
-                die(T("У {0} доступ до всіх сайтів. Задайте список: wgctl set {1} --sites ...", a.who, a.who))
+        if cur == "*":                       # all sites: grant/deny edit the per-site exceptions
+            exc = set(p.get("except") or [])
+            p["except"] = sorted(exc | set(a.sites)) if revoke else sorted(exc - set(a.sites))
+            if not p["except"]:
+                p.pop("except")
+        elif revoke:
             p["sites"] = [s for s in cur if s not in a.sites]
         else:
-            if cur == "*":
-                die(T("У {0} уже доступ до всіх сайтів", a.who))
             p["sites"] = sorted(set(cur) | set(a.sites))
         save(st)
         apply(st, wg=False)
     what = T("Забрано доступ") if revoke else T("Надано доступ")
     log(f"EVENT:info {what}: {a.who} -> {', '.join(a.sites)}")
-    print(T("{0}: сайти {1}", a.who, sites_str(p['sites'])))
+    print(T("{0}: сайти {1}", a.who, sites_str(p['sites'], p.get("except"))))
 
 
 # ---- Cloudflare ------------------------------------------------------------
@@ -1333,6 +1342,8 @@ def cmd_site_rm(a):
         for p in list(st["clients"].values()) + list(st["locations"].values()):
             if isinstance(p.get("sites"), list) and a.name in p["sites"]:
                 p["sites"].remove(a.name)
+            if a.name in (p.get("except") or []):
+                p["except"].remove(a.name)
         save(st)
         apply(st, wg=False)
     notify(T("Видалено сайт: {0}.{1}", a.name, DOMAIN), "access")
@@ -1419,7 +1430,7 @@ def location_view(name, l, peers):
              "warn" if age > LOCATION_WARN_SEC else "ok")
     return {"name": name, "note": l.get("note", ""), "title": l.get("title") or name, "state": state,
             "handshake": hs, "endpoint": (p or {}).get("endpoint", ""), "ip": l.get("ip"),
-            "sites": l.get("sites", []), "networks": l.get("networks", []), "managed": bool(l.get("managed")),
+            "sites": l.get("sites", []), "except": l.get("except", []), "networks": l.get("networks", []), "managed": bool(l.get("managed")),
             "panel": bool(l.get("panel")), "has_conf": os.path.exists(f"{CONF_DIR}/location-{name}.conf")}
 
 
@@ -3788,7 +3799,10 @@ def cmd_location(a):
             if a.note is not None:
                 l["note"] = clean_note(a.note)
             if a.sites is not None:
-                l["sites"] = parse_sites(st, a.sites)
+                new = parse_sites(st, a.sites)
+                if not (new == "*" and l.get("sites") == "*"):
+                    l.pop("except", None)
+                l["sites"] = new
             save(st)
             apply(st)
             log(T("EVENT:info Змінено локацію {0}", name))
