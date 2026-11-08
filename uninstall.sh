@@ -77,7 +77,7 @@ if [ "$PURGE" = 1 ]; then
   rm -rf /etc/wgctl /etc/vpnadmin /var/lib/wgctl /var/log/wgctl.log* /var/log/caddy/wgctl-access.log* \
          /etc/caddy/wgctl.caddy /etc/caddy/cloudflare.env "/etc/wireguard/$IFACE.conf"
   grep -q 'cloudflare.nft' /etc/nftables.conf 2>/dev/null || rm -f /etc/nftables.d/cloudflare.nft
-  id vpnadmin >/dev/null 2>&1 && userdel vpnadmin || true
+  if id vpnadmin >/dev/null 2>&1; then userdel vpnadmin || true; fi
   if grep -q 'wgctl.caddy' /etc/caddy/Caddyfile 2>/dev/null; then
     echo "/etc/caddy/Caddyfile still imports wgctl.caddy: edit it, then: sudo systemctl restart caddy"
   else

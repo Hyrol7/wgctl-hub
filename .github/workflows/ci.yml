@@ -35,7 +35,9 @@ jobs:
           curl -fsSL -o caddy "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com%2Fcaddy-dns%2Fcloudflare"
           chmod +x caddy
       - name: Validate a generated Caddyfile
-        run: tests/caddy_validate.sh "$PWD/caddy"
+        run: |
+          sudo install -d -m 0777 /var/log/caddy      # the generated config logs to the real path
+          tests/caddy_validate.sh "$PWD/caddy"
 
   shell:
     runs-on: ubuntu-latest

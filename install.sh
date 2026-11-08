@@ -30,7 +30,7 @@ say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m!! %s\033[0m\n' "$*"; }
 die()  { printf '\033[31mError: %s\033[0m\n' "$*" >&2; exit 1; }
 ask()  { [ "$YES" = 1 ] && return 0; read -r -p "$1 [y/N] " r; [[ "$r" =~ ^[YyТт] ]]; }
-keep() { [ -e "$1" ] && [ ! -e "$1.before-wgctl" ] && cp -a "$1" "$1.before-wgctl" || true; }
+keep() { if [ -e "$1" ] && [ ! -e "$1.before-wgctl" ]; then cp -a "$1" "$1.before-wgctl"; fi; }
 
 [ "$(id -u)" = 0 ] || die "run as root: sudo $0"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "Python 3.11+ is required (tomllib)"
@@ -133,8 +133,8 @@ PY
 
 # ---- 4. firewall -------------------------------------------------------------
 say "3/6 Firewall (nftables)"
-WAN=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-SSH_PORT=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
+WAN=$( (ip -4 route show default || true) | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+SSH_PORT=$( (sshd -T 2>/dev/null || true) | awk '$1=="port"{print $2; exit}')
 SSH_PORT=${SSH_PORT:-22}
 if grep -q 'wgctl_tcp' /etc/nftables.conf 2>/dev/null; then
   echo "/etc/nftables.conf already has the wgctl rules, keeping it."
