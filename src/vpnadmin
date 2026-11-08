@@ -1,0 +1,2140 @@
+#!/usr/bin/env python3
+"""vpnadmin: web panel of the VPN hub (WireGuard + Caddy), works together with wgctl.
+
+  vpnadmin setup         create the account (password + TOTP + backup codes)
+  vpnadmin passwd        change the password (over SSH, without the old password)
+  vpnadmin reset-totp    new TOTP secret and new backup codes (if the phone is lost)
+  vpnadmin backup-codes  new backup codes
+  vpnadmin serve         run the panel on 127.0.0.1:8090 (systemd service)
+
+All VPN logic lives in wgctl; the panel calls it through sudo.
+"""
+import base64
+import getpass
+import hashlib
+import hmac
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import shlex
+import socketserver
+from concurrent.futures import ThreadPoolExecutor
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+VERSION = "1.0.0"
+
+
+def _load_config():
+    """Settings shared with wgctl: /etc/wgctl/config.toml (no secrets in it, readable by everyone)."""
+    import tomllib
+    try:
+        with open(os.environ.get("WGCTL_CONFIG", "/etc/wgctl/config.toml"), "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except PermissionError as ex:
+        sys.exit(f"vpnadmin: {ex}. The panel user must be able to read config.toml: sudo chmod 0711 /etc/wgctl")
+    except tomllib.TOMLDecodeError as ex:
+        sys.exit(f"{os.environ.get('WGCTL_CONFIG') or '/etc/wgctl/config.toml'}: {ex}")
+
+
+CFG = _load_config()
+
+
+def cfg(section, key, default):
+    return CFG.get(section, {}).get(key, default)
+
+
+# ---- translation: Ukrainian templates in code, translations in share/i18n/<lang>.json ----
+LANG = cfg("general", "language", "en")
+SHARE = os.environ.get("WGCTL_SHARE", "/usr/local/share/wgctl")
+
+
+def _load_catalog(lang):
+    if lang == "uk":
+        return {}
+    try:
+        with open(f"{SHARE}/i18n/{lang}.json", encoding="utf-8") as f:
+            return {k: v for k, v in json.load(f).items() if v}
+    except (OSError, ValueError):
+        return {}
+
+
+_CAT = _load_catalog(LANG)
+# "uk" is the source language; every share/i18n/<code>.json adds another one
+LANGUAGES = ["uk"] + sorted(f[:-5] for f in (os.listdir(f"{SHARE}/i18n") if os.path.isdir(f"{SHARE}/i18n") else [])
+                            if f.endswith(".json") and f[:-5] != "uk")
+
+
+def T(tpl, *args):
+    """Translate a template into the language from config.toml; without a translation it stays Ukrainian."""
+    return _CAT.get(tpl, tpl).format(*args)
+
+
+DOMAIN = cfg("network", "domain", "example.com")
+BRAND = cfg("panel", "brand", "VPN hub")
+HUB_IP = cfg("network", "subnet", "10.77.0.0/24").split("/")[0].rsplit(".", 1)[0] + ".1"
+NET = HUB_IP[:-1]
+AUTH_DIR = os.environ.get("VPNADMIN_DIR", "/etc/vpnadmin")
+AUTH_FILE = f"{AUTH_DIR}/auth.json"
+WGCTL = shlex.split(os.environ.get("VPNADMIN_WGCTL", "sudo -n /usr/local/sbin/wgctl"))
+BIND = os.environ.get("VPNADMIN_BIND", "127.0.0.1")
+PORT = int(os.environ.get("VPNADMIN_PORT", "8090"))
+ORIGIN = os.environ.get("VPNADMIN_ORIGIN", f"https://{cfg('panel', 'subdomain', 'vpnadmin')}.{DOMAIN}")
+COOKIE = os.environ.get("VPNADMIN_COOKIE", "__Host-vpnadmin")
+IDLE_SEC, MAX_SEC = 30 * 60, 12 * 3600
+INACTIVE_DAYS = int(cfg("policy", "inactive_days", 60))      # as in wgctl
+FAIL_LIMIT, FAIL_WINDOW = 5, 15 * 60
+FRESH_SEC = 5 * 60                       # after a TOTP code, critical actions need no repeat for this long
+CODE_FAILS = 5                           # wrong codes in a session before it ends
+MAX_SESSIONS = 10
+CONF_GRACE = 10 * 60                     # the config of a just-created key is shown without a code
+TZ = ZoneInfo(cfg("general", "timezone", "UTC"))
+NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,29}[a-z0-9])?$")   # like a DNS label: no trailing hyphen
+NAME_PATTERN = r"[a-z0-9](?:[a-z0-9\-]{0,29}[a-z0-9])?"            # the same for the browser (pattern attribute)
+NAME_HINT = T("Латиниця a-z, цифри, дефіс; до 31 символу, без дефіса на початку і в кінці. Великі літери стануть малими.")
+
+
+# ---- credentials ------------------------------------------------------------
+def scrypt(password, salt):
+    return hashlib.scrypt(password.encode(), salt=salt, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024).hex()
+
+
+def make_pw(password):
+    salt = secrets.token_bytes(16)
+    return {"salt": salt.hex(), "hash": scrypt(password, salt)}
+
+
+def check_pw(rec, password):
+    return hmac.compare_digest(scrypt(password, bytes.fromhex(rec["salt"])), rec["hash"])
+
+
+def same(a, b):
+    """Constant-time comparison; str.compare_digest fails on non-ASCII."""
+    return hmac.compare_digest(str(a).encode(), str(b).encode())
+
+
+def totp_at(secret, counter):
+    key = base64.b32decode(secret)
+    h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    return f"{(struct.unpack('>I', h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000:06d}"
+
+
+def totp_check(auth, code):
+    """TOTP code (±30 s), the same code is never accepted twice."""
+    code = re.sub(r"\s", "", code or "")
+    if not re.fullmatch(r"\d{6}", code):
+        return False
+    now = int(time.time()) // 30
+    for c in (now - 1, now, now + 1):
+        if c > auth.get("totp_last", 0) and hmac.compare_digest(totp_at(auth["totp"], c), code):
+            auth["totp_last"] = c
+            return True
+    return False
+
+
+def make_backup_codes():
+    codes, recs = [], []
+    for _ in range(10):
+        raw = base64.b32encode(secrets.token_bytes(5)).decode().lower()
+        code = f"{raw[:4]}-{raw[4:8]}"
+        salt = secrets.token_bytes(8)
+        codes.append(code)
+        recs.append({"salt": salt.hex(), "hash": hashlib.sha256(salt + code.encode()).hexdigest(), "used": 0})
+    return codes, recs
+
+
+def backup_check(auth, code):
+    code = (code or "").strip().lower().replace(" ", "")
+    if not re.fullmatch(r"[a-z2-7]{4}-[a-z2-7]{4}", code):
+        return False
+    for r in auth["backup"]:
+        if not r["used"] and hmac.compare_digest(
+                hashlib.sha256(bytes.fromhex(r["salt"]) + code.encode()).hexdigest(), r["hash"]):
+            r["used"] = int(time.time())
+            return True
+    return False
+
+
+_auth_lock = threading.Lock()
+
+
+def load_auth():
+    with open(AUTH_FILE) as f:
+        return json.load(f)
+
+
+def save_auth(auth):
+    tmp = AUTH_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w") as f:
+        json.dump(auth, f, indent=2)
+    try:
+        st = os.stat(AUTH_DIR)
+        os.chown(tmp, st.st_uid, st.st_gid)      # setup runs as root
+    except OSError:
+        pass
+    os.replace(tmp, AUTH_FILE)
+
+
+# ---- CLI -------------------------------------------------------------------
+def ask_password():
+    while True:
+        p1 = getpass.getpass(T("Новий пароль (мін. 12 символів): "))
+        if len(p1) < 12:
+            print(T("Закороткий"))
+            continue
+        if p1 != getpass.getpass(T("Ще раз: ")):
+            print(T("Не збігається"))
+            continue
+        return p1
+
+
+def enroll_totp(user):
+    secret = base64.b32encode(secrets.token_bytes(20)).decode()
+    uri = (f"otpauth://totp/{urllib.parse.quote(BRAND)}:{urllib.parse.quote(user)}?secret={secret}"
+           f"&issuer={urllib.parse.quote(BRAND)}")
+    print(T("\nВідскануйте QR у застосунку для кодів (Google Authenticator, 1Password, Authy):\n"))
+    try:
+        subprocess.run(["qrencode", "-t", "ansiutf8"], input=uri.encode())
+    except FileNotFoundError:
+        print(T("(немає qrencode, введіть секрет вручну)"))
+    print(T("Секрет текстом (збережіть у менеджері паролів):"), " ".join(secret[i:i + 4] for i in range(0, 32, 4)))
+    for _ in range(3):
+        code = input(T("\nВведіть код із застосунку для перевірки: "))
+        if totp_check({"totp": secret}, code):
+            return secret
+        print(T("Код не підходить. Перевірте час на телефоні і спробуйте ще раз"))
+    sys.exit(T("TOTP не підтверджено, нічого не змінено"))
+
+
+def print_codes(codes):
+    print(T("\nРезервні коди (кожен діє один раз, замість коду з телефона). ЗБЕРЕЖІТЬ ЇХ:\n"))
+    for i in range(0, 10, 2):
+        print(f"   {codes[i]}     {codes[i + 1]}")
+    print()
+
+
+def cli_setup(force):
+    if os.path.exists(AUTH_FILE) and not force:
+        sys.exit(T("Обліковий запис уже є ({0}). Повторно: vpnadmin setup --force", AUTH_FILE))
+    os.makedirs(AUTH_DIR, mode=0o700, exist_ok=True)
+    user = input(T("Логін [admin]: ")).strip() or "admin"
+    pw = ask_password()
+    secret = enroll_totp(user)
+    codes, recs = make_backup_codes()
+    save_auth({"user": user, "pw": make_pw(pw), "totp": secret, "totp_last": 0, "backup": recs,
+               "created": int(time.time()), "pw_changed": int(time.time()), "epoch": 1})
+    print_codes(codes)
+    print(T("Готово. Обліковий запис створено."))
+
+
+def cli_passwd():
+    auth = load_auth()
+    auth["pw"] = make_pw(ask_password())
+    auth["pw_changed"] = int(time.time())
+    auth["epoch"] = auth.get("epoch", 1) + 1          # ends all sessions
+    save_auth(auth)
+    print(T("Пароль змінено, усі сесії завершено (після перезапуску служби)."))
+
+
+def cli_reset_totp():
+    auth = load_auth()
+    auth["totp"] = enroll_totp(auth["user"])
+    auth["totp_last"] = 0
+    codes, auth["backup"] = make_backup_codes()
+    auth["epoch"] = auth.get("epoch", 1) + 1
+    save_auth(auth)
+    print_codes(codes)
+    print(T("TOTP скинуто, старі резервні коди більше не діють."))
+
+
+def cli_backup_codes():
+    auth = load_auth()
+    codes, auth["backup"] = make_backup_codes()
+    save_auth(auth)
+    print_codes(codes)
+
+
+# ---- calling wgctl -----------------------------------------------------------
+# Every wgctl call is a separate process through sudo (~0.1-0.3 s). Reads are cached for a few seconds
+# and run in parallel; any change clears the cache, so after an action the page is always fresh.
+CACHE_SEC = 3
+_cache, _cache_lock = {}, threading.Lock()
+_READ = {"status", "list", "show", "log", "conf", "qr", "server", "config", "history", "visits"}
+_READ2 = {("site", "list"), ("notify", "show"), ("notify", "groups"), ("tcp", "list")}
+
+
+def _is_read(args):
+    return bool(args) and (args[0] in _READ or tuple(args[:2]) in _READ2)
+
+
+def wg(*args, timeout=60):
+    args = [str(a) for a in args]
+    write = not _is_read(args)
+    if write:
+        with _cache_lock:
+            _cache.clear()
+    try:
+        r = subprocess.run(WGCTL + args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, "", T("wgctl не відповів вчасно")
+    finally:
+        if write:
+            with _cache_lock:
+                _cache.clear()
+    return r.returncode, r.stdout, (r.stderr or r.stdout).strip()
+
+
+def wgj(*args):
+    key = tuple(str(a) for a in args)
+    with _cache_lock:
+        hit = _cache.get(key)
+    if hit and time.monotonic() - hit[0] < CACHE_SEC:
+        return json.loads(hit[1])            # a new copy: pages may modify the data
+    rc, out, err = wg(*args, "--json")
+    if rc != 0:
+        raise RuntimeError(err)
+    data = json.loads(out)
+    with _cache_lock:
+        _cache[key] = (time.monotonic(), out)
+    return data
+
+
+_pool = ThreadPoolExecutor(max_workers=6)
+
+
+def event(text, level="warning", icon="🛡"):
+    """A security event to the log and Signal. In the background: sending does not delay the page.
+    level: critical — also to admins privately; warning — to the group chat."""
+    _pool.submit(wg, "event", "--cat", "security", "--level", level, opt("icon", icon), "--", text)
+
+
+def prefetch(*calls):
+    """Runs several wgctl reads at once; errors surface in the normal wgj()."""
+    futs = [_pool.submit(wgj, *c) for c in calls]
+    for f in futs:
+        try:
+            f.result()
+        except Exception:
+            pass
+
+
+def norm_name(v):
+    """HP-PC my_work -> hp-pc-my-work: the same as the JS in the form does."""
+    return re.sub(r"[\s_.]+", "-", str(v).strip().lower())
+
+
+def opt(name, value):
+    """--name=value: a value starting with "-" is never taken for another option."""
+    return f"--{name}={str(value)[:4000]}"
+
+
+# ---- formatting -------------------------------------------------------------
+e = html.escape
+
+
+def fmt_ts(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M") if ts else "-"
+
+
+def ago(ts):
+    if not ts:
+        return T("ніколи")
+    s = max(0, int(time.time()) - ts)
+    if s < 60:
+        return T("{0} с тому", s)
+    if s < 3600:
+        return T("{0} хв тому", s // 60)
+    if s < 86400:
+        return T("{0} год тому", s // 3600)
+    return T("{0} дн тому", s // 86400)
+
+
+def hm(sec):
+    """3700 -> "1 h 1 min"."""
+    sec = max(0, int(sec or 0))
+    h, m = sec // 3600, sec % 3600 // 60
+    return ((T("{0} год ", h) if h else "") + T("{0} хв", m)) if h or m else T("менше хвилини")
+
+
+GUEST_HOURS = (2, 4, 8, 24, 48)
+SVC_KINDS = {"ssh": ("SSH", 22), "rdp": (T("Віддалений робочий стіл (RDP)"), 3389), "vnc": ("VNC", 5900), "tcp": (T("Інший TCP-порт"), 0)}
+
+
+def item_href(it):
+    if it.get("agg"):
+        return "/sites#tcp"
+    return f'/t/{it["name"]}' if it.get("svc") else f'/s/{it["name"]}'
+
+
+def svc_howto(sv):
+    host = f'{sv["host"]}'
+    if sv["kind"] == "ssh":
+        return T("ssh -p {0} користувач@{1}", sv["port"], host)
+    if sv["kind"] == "rdp":
+        return T("Віддалений робочий стіл: {0}:{1}", host, sv["port"])
+    return f'{host}:{sv["port"]}'
+
+ROTATE_CHOICES = ((90, T("раз на 90 днів")), (180, T("раз на 180 днів")), (365, T("раз на рік")), (0, T("не нагадувати")))
+
+
+def human(b):
+    b = float(b or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if b < 1024 or unit == "TiB":
+            return f"{b:.0f} {unit}" if unit == "B" else f"{b:.1f} {unit}"
+        b /= 1024
+
+
+def place(g):
+    s = " ".join(x for x in (g.get("cc", ""), g.get("city", "")) if x)
+    return s or (g.get("ip") or "-")
+
+
+STATE_WORD = {"s-ok": T("Усе працює"), "s-warn": T("Потрібна увага"), "s-bad": T("Збій"), "s-idle": ""}
+STATUS = {"active": (T("активний"), "ok"), "disabled": (T("вимкнений"), "warn"), "revoked": (T("відкликаний"), "muted")}
+REASON = {"manual": T("вручну"), "expired": T("минув термін"), "suspicious": T("підозріла активність")}
+CAT = {"security": T("безпека"), "access": T("доступ"), "warn": T("увага"), "health": T("стан"), "connect": T("зв'язок"), "info": T("інфо")}
+
+
+def badge(text, kind):
+    return f'<span class="badge {kind}">{e(text)}</span>'
+
+
+def dot(kind):
+    return f'<span class="dot {kind}" aria-hidden="true"></span>'
+
+
+# ---- static files: content-hashed version, cached for a year, pre-gzipped ----
+# Files live in SHARE (default /usr/local/share/wgctl): styles, script, icon, fonts, translations.
+import gzip as _gzip
+STATIC = {}
+for _path, _file, _type in (("/static/app.css", "static/app.css", "text/css; charset=utf-8"),
+                            ("/static/app.js", "static/app.js", "application/javascript; charset=utf-8"),
+                            ("/favicon.svg", "static/favicon.svg", "image/svg+xml")):
+    with open(f"{SHARE}/{_file}", "rb") as _f:
+        _raw = _f.read()
+    STATIC[_path] = (_raw, _gzip.compress(_raw, 9, mtime=0), _type, hashlib.sha256(_raw).hexdigest()[:10])
+ASSET_V = {k: v[3] for k, v in STATIC.items()}
+FONT_BIN = {}
+for _fn in sorted(os.listdir(f"{SHARE}/static/fonts")):
+    if _fn.endswith(".woff2"):
+        with open(f"{SHARE}/static/fonts/{_fn}", "rb") as _f:
+            FONT_BIN[_fn[:-6]] = _f.read()
+
+
+# ---- sessions and protection -----------------------------------------------
+SESSIONS = {}
+FAILS = {}
+_lock = threading.Lock()
+
+
+def new_session(ip, ua, epoch):
+    tok = secrets.token_urlsafe(32)
+    t = time.time()
+    with _lock:
+        for k in [k for k, v in SESSIONS.items() if t - v["seen"] > IDLE_SEC or t - v["created"] > MAX_SEC]:
+            SESSIONS.pop(k, None)
+        while len(SESSIONS) >= MAX_SESSIONS:
+            SESSIONS.pop(min(SESSIONS, key=lambda k: SESSIONS[k]["seen"]), None)
+        # fresh=0: critical actions need a code even right after login
+        SESSIONS[tok] = {"tok": tok, "csrf": secrets.token_urlsafe(24), "created": t, "seen": t, "ip": ip,
+                         "ua": ua[:120], "fresh": 0, "code_fails": 0, "made": {}, "flash": [], "epoch": epoch}
+    return tok
+
+
+def failed(ip):
+    """Records a failure; returns the number of failures from this IP within the window."""
+    t = time.time()
+    with _lock:
+        for k in [k for k, v in FAILS.items() if not v or v[-1] < t - FAIL_WINDOW]:
+            FAILS.pop(k, None)
+        FAILS.setdefault(ip, []).append(t)
+        FAILS[ip] = [x for x in FAILS[ip] if x > t - FAIL_WINDOW]
+        return len(FAILS[ip])
+
+
+def locked(ip):
+    t = time.time()
+    with _lock:
+        mine = [x for x in FAILS.get(ip, []) if x > t - FAIL_WINDOW]
+        total = sum(1 for v in FAILS.values() for x in v if x > t - FAIL_WINDOW)
+    return len(mine) >= FAIL_LIMIT or total >= FAIL_LIMIT * 4
+
+
+# ---- HTTP ------------------------------------------------------------------
+class Redirect(Exception):
+    def __init__(self, to):
+        self.to = to
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    server_version = "vpnadmin"
+    sys_version = ""
+    timeout = 30                                   # slow connections do not hold threads
+
+    def log_message(self, fmt, *args):
+        pass
+
+    # -- helpers
+    def ip(self):
+        """Client address. X-Forwarded-For is trusted only from Caddy on this machine (the last value)."""
+        peer = self.client_address[0]
+        if peer in ("127.0.0.1", "::1"):
+            xff = [x.strip() for x in self.headers.get("X-Forwarded-For", "").split(",") if x.strip()]
+            if xff:
+                return xff[-1]
+        return peer
+
+    def same_origin(self):
+        """For POST: Origin must be ours; without Origin only Sec-Fetch-Site: same-origin is accepted."""
+        origin = self.headers.get("Origin")
+        if origin:
+            return origin == ORIGIN
+        return self.headers.get("Sec-Fetch-Site") == "same-origin"
+
+    def session(self):
+        cookie = self.headers.get("Cookie", "")
+        m = re.search(rf"(?:^|;\s*){re.escape(COOKIE)}=([\w-]+)", cookie)
+        if not m:
+            return None, None
+        tok = m.group(1)
+        s = SESSIONS.get(tok)
+        t = time.time()
+        if not s:
+            return None, None
+        try:
+            epoch = load_auth().get("epoch", 1)
+        except OSError:
+            epoch = -1
+        if t - s["seen"] > IDLE_SEC or t - s["created"] > MAX_SEC or s["epoch"] != epoch:
+            SESSIONS.pop(tok, None)
+            return None, None
+        s["seen"] = t
+        return tok, s
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        if "Cache-Control" not in (headers or {}):
+            self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+                         "frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect(self, to, headers=None):
+        self.send_response(303)
+        self.send_header("Location", to)
+        self.send_header("Content-Length", "0")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def form(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > 64 * 1024:
+            raise ValueError("too big")
+        q = urllib.parse.parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+        return {k: v if len(v) > 1 else v[0] for k, v in q.items()}
+
+    def flash(self, s, kind, text):
+        s["flash"].append((kind, text))
+
+    # -- routing
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+    def route(self, method):
+        url = urllib.parse.urlsplit(self.path)
+        path, qs = url.path, urllib.parse.parse_qs(url.query)
+        try:
+            if path in STATIC:
+                raw, gz, ctype, ver = STATIC[path]
+                hdr = {"Cache-Control": "public, max-age=31536000, immutable" if qs.get("v") == [ver]
+                       else "public, max-age=3600", "Vary": "Accept-Encoding"}
+                if "gzip" in self.headers.get("Accept-Encoding", ""):
+                    return self.send(200, gz, ctype, {**hdr, "Content-Encoding": "gzip"})
+                return self.send(200, raw, ctype, hdr)
+            mf = re.fullmatch(r"/static/f/([a-z-]+)\.woff2", path)
+            if mf and mf.group(1) in FONT_BIN:
+                return self.send(200, FONT_BIN[mf.group(1)], "font/woff2",
+                                 {"Cache-Control": "public, max-age=2592000, immutable"})
+            if path == "/login":
+                return self.login(method)
+            self.qs = qs
+            tok, s = self.session()
+            if not s:
+                return self.redirect("/login")
+            if method == "POST":
+                f = self.form()
+                if not self.same_origin() or not same(f.get("csrf", ""), s["csrf"]):
+                    return self.send(403, T("Запит відхилено (CSRF)"), "text/plain; charset=utf-8")
+            else:
+                f = {}
+            # names as in wgctl: start with a letter or digit, so "/c/--admin" never becomes a wgctl option
+            m = re.fullmatch(rf"/c/({NAME_PATTERN})(/conf)?", path)
+            ms = re.fullmatch(rf"/s/({NAME_PATTERN})", path)
+            mt = re.fullmatch(rf"/t/({NAME_PATTERN})", path)
+            ml = re.fullmatch(rf"/l/({NAME_PATTERN})(/conf)?", path)
+            if path == "/":
+                body = self.page_overview(s, qs.get("f", [""])[0])
+            elif path == "/logout" and method == "POST":
+                SESSIONS.pop(tok, None)
+                return self.redirect("/login", {"Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict"})
+            elif path == "/new":
+                body = self.page_new(s, method, f)
+            elif m and m.group(2):
+                if method != "POST":
+                    raise Redirect(f"/c/{m.group(1)}")
+                return self.conf_out(s, m.group(1), f)
+            elif m:
+                body = self.page_client(s, m.group(1), method, f)
+            elif path == "/locations":
+                body = self.page_locations(s, method, f)
+            elif ml and ml.group(2):
+                if method != "POST":
+                    raise Redirect(f"/l/{ml.group(1)}")
+                return self.location_conf(s, ml.group(1), f)
+            elif ml:
+                body = self.page_location(s, ml.group(1), method, f)
+            elif path == "/sites":
+                body = self.page_sites(s, method, f)
+            elif ms:
+                body = self.page_site(s, ms.group(1), method, f)
+            elif mt:
+                body = self.page_svc(s, mt.group(1), method, f)
+            elif path == "/log":
+                body = self.page_log(s, qs.get("client", [""])[0], qs.get("cat", [""])[0])
+            elif path == "/settings":
+                body = self.page_settings(s, tok, method, f)
+            elif path == "/server":
+                body = self.page_server(s, method, f)
+            else:
+                return self.send(404, self.layout(s, T("Не знайдено"), self.hero(T("Сторінку не знайдено"), small=True), ""))
+            self.send(200, body)
+        except Redirect as r:
+            self.redirect(r.to)
+        except ValueError:
+            self.send(400, T("Некоректний запит"), "text/plain; charset=utf-8")
+        except Exception as ex:      # no tracebacks to the outside
+            sys.stderr.write(f"error {self.path}: {ex!r}\n")
+            self.send(500, T("Внутрішня помилка панелі. Деталі: journalctl -u vpnadmin"), "text/plain; charset=utf-8")
+
+
+    # -- page frame
+    def sys_state(self, st=None):
+        """System state for the status strip: (class, sentence, subline)."""
+        st = st or wgj("status")
+        problems = []
+        if st["wg0"] != "ok":
+            problems.append(T("WireGuard на VPS не працює"))
+        if st["caddy"] != "ok":
+            problems.append(T("Caddy не працює"))
+        for l in st["locations"]:
+            if l["state"] == "down":
+                problems.append(T("{0} без зв'язку", l.get('title') or l['name']))
+        if problems:
+            return "s-bad", problems[0][:1].upper() + problems[0][1:], problems
+        attn = st["suspects"] + st["expiring"]
+        down = [x["name"] for grp in st["topology"]["locations"].values() for x in grp if x["ok"] is False]
+        down += [x["name"] for x in st["topology"]["other"] + st["topology"]["vps"] if x["ok"] is False]
+        down += [x["name"] for d in st["topology"]["devices"] for x in d["sites"] if x["ok"] is False and d["online"]]
+        if attn or down or (st.get("cert_days") is not None and st["cert_days"] <= 14):
+            if st["suspects"]:
+                title = (T("{0} під підозрою", st['suspects'][0]) if len(st["suspects"]) == 1
+                         else T("{0} пристрої під підозрою", len(st['suspects'])))
+            elif st["expiring"]:
+                title = (T("{0} скоро відкличеться", st['expiring'][0]) if len(st["expiring"]) == 1
+                         else T("{0} ключі скоро відкличуться", len(st['expiring'])))
+            elif down:
+                title = T("{0} не відповідає", down[0])
+            else:
+                title = T("Скоро закінчиться сертифікат")
+            why = [T("{0}: підозріла активність", n) for n in st["suspects"]]
+            why += [T("{0}: скоро автовідкликання", n) for n in st["expiring"]]
+            why += [T("{0} не відповідає", n) for n in down]
+            if st.get("cert_days") is not None and st["cert_days"] <= 14:
+                why.append(T("сертифікат закінчується через {0} дн", st['cert_days']))
+            return "s-warn", title, why
+        return "s-ok", T("Мережа працює"), []
+
+    def layout(self, s, title, hero, content, active="", state="s-idle", refresh=False, fab=""):
+        nav = "".join(f'<a href="{h}" class="{"on" if active == k else ""}">{t}</a>' for k, h, t in (
+            ("home", "/", T("Огляд")), ("locations", "/locations", T("Локації")), ("sites", "/sites", T("Сайти")), ("log", "/log", T("Журнал")),
+            ("server", "/server", T("Сервер")), ("settings", "/settings", T("Налаштування"))))
+        flashes = ""
+        if s and s["flash"]:
+            flashes = '<div class="flash">' + "".join(f'<div class="note {k}">{e(t)}</div>' for k, t in s["flash"]) + "</div>"
+            s["flash"] = []
+        bar = (T("<div class=\"bar\"><a class=\"logo\" href=\"/\" title=\"{0}\">{1}</a><nav>{2}</nav><form method=\"post\" action=\"/logout\">{3}<button class=\"exit\">Вийти</button></form></div>", STATE_WORD.get(state, ""), e(BRAND), nav, self.csrf(s))) if s else ""
+        return f"""<!doctype html><html lang="{LANG}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark">
+<link rel="preload" href="/static/f/onest-cyr.woff2" as="font" type="font/woff2" crossorigin>
+<title>{e(title)} · {e(BRAND)}</title><link rel="icon" href="/favicon.svg?v={ASSET_V['/favicon.svg']}"><link rel="stylesheet" href="/static/app.css?v={ASSET_V['/static/app.css']}">
+</head><body class="{state}{' has-fab' if fab else ''}"{' data-refresh="1"' if refresh else ''}>{bar}{hero}{flashes}
+<main>{content}</main>{fab}
+<footer>vpnadmin {VERSION} · <a href="https://db-ip.com" rel="noopener">IP Geolocation by DB-IP</a></footer>
+<script src="/static/app.js?v={ASSET_V['/static/app.js']}"></script></body></html>"""
+
+    @staticmethod
+    def hero(title, lead="", acts="", facts=None, small=False, chip=""):
+        f = ""
+        if facts:
+            f = '<div class="facts">' + "".join(f'<div><b>{e(str(v))}</b><span>{e(k)}</span></div>' for v, k in facts) + "</div>"
+        return (f'<section class="hero{" small" if small else ""}">' + (f'<span class="chip">{e(chip)}</span>' if chip else "")
+                + f'<h1>{e(title)}</h1>'
+                + (f"<p>{lead}</p>" if lead else "") + (f'<div class="act">{acts}</div>' if acts else "") + "</section>" + f)
+
+    @staticmethod
+    def sessions_snapshot():
+        with _lock:
+            return list(SESSIONS.items())
+
+    def csrf(self, s):
+        return f'<input type="hidden" name="csrf" value="{s["csrf"]}">' if s else ""
+
+    def bform(self, s, act, label, cls="b", confirm=""):
+        cf = f' data-confirm="{e(confirm)}"' if confirm else ""
+        return (f'<form method="post"{cf}>{self.csrf(s)}<input type="hidden" name="act" value="{act}">'
+                f'<button class="{cls}">{e(label)}</button></form>')
+
+    @staticmethod
+    def code_field(fid="code", required=False, label=T("Код із застосунку")):
+        return (f'<div><label class="f" for="{fid}">{label}</label><input class="code" type="text" id="{fid}" name="code" '
+                f'inputmode="numeric" autocomplete="one-time-code" placeholder="123456"{" required" if required else ""}></div>')
+
+    # -- login
+    def login(self, method):
+        ip = self.ip()
+        err = ""
+        if method == "POST":
+            f = self.form()
+            if not self.same_origin():
+                return self.send(403, T("Запит відхилено"), "text/plain; charset=utf-8")
+            # the lockout check is inside the lock: parallel requests cannot bypass the limit
+            with _auth_lock:
+                if locked(ip):
+                    err = T("Забагато невдалих спроб. Спробуйте через 15 хвилин.")
+                    ok = None
+                else:
+                    try:
+                        auth = load_auth()
+                    except OSError:
+                        return self.send(503, T("Обліковий запис не створено: vpnadmin setup"), "text/plain; charset=utf-8")
+                    # scrypt always runs: response time does not reveal whether the login was right
+                    pw_ok = check_pw(auth["pw"], str(f.get("password", ""))[:1024])
+                    ok = same(f.get("user", ""), auth["user"]) and pw_ok
+                    code = str(f.get("code", ""))
+                    used_backup = False
+                    if ok and not totp_check(auth, code):
+                        used_backup = backup_check(auth, code)
+                        ok = used_backup
+                    if ok:
+                        save_auth(auth)
+                    else:
+                        n = failed(ip)
+            if ok is None:
+                pass                                   # locked out, nothing is computed
+            elif ok:
+                left = sum(1 for r in auth["backup"] if not r["used"])
+                tok = new_session(ip, self.headers.get("User-Agent", ""), auth.get("epoch", 1))
+                s = SESSIONS[tok]
+                if used_backup:
+                    self.flash(s, "warn", T("Вхід за резервним кодом. Лишилось кодів: {0}. Якщо телефон втрачено, скиньте TOTP: vpnadmin reset-totp (через SSH).", left))
+                event(T("Вхід у панель з {0}", ip) + (T(" (резервний код)") if used_backup else ""),
+                      "critical" if used_backup else "warning", "🔓")
+                return self.redirect("/", {"Set-Cookie": f"{COOKIE}={tok}; Path=/; Secure; HttpOnly; SameSite=Strict"})
+            else:
+                # only the first failure and the lockout go to Signal, no spam during brute force
+                if n == 1:
+                    event(T("Невдала спроба входу в панель з {0}", ip), "warning", "🔐")
+                elif n == FAIL_LIMIT:
+                    event(T("Вхід із {0} заблоковано на 15 хв: {1} невдалих спроб", ip, n), "critical", "⛔")
+                err = T("Невірний логін, пароль або код.")
+        body = T("<div class=\"login\"><span class=\"logo\">{0}</span><div class=\"panel\">\n<h2>Вхід у панель</h2>{1}\n<form method=\"post\" action=\"/login\" autocomplete=\"on\">\n<label class=\"f\" for=\"u\">Логін</label><input type=\"text\" id=\"u\" name=\"user\" autocomplete=\"username\" required>\n<label class=\"f\" for=\"p\">Пароль</label><input type=\"password\" id=\"p\" name=\"password\" autocomplete=\"current-password\" required>\n<label class=\"f\" for=\"c\">Код із застосунку або резервний код</label>\n<input type=\"text\" id=\"c\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" placeholder=\"123456\" required>\n<div class=\"row\"><button class=\"btn pri\">Увійти</button></div></form>\n<p class=\"small muted\">Телефону з кодами немає під рукою? Введіть резервний код (xxxx-xxxx) або скиньте TOTP через SSH: vpnadmin reset-totp.</p></div></div>", e(BRAND), f'<div class="note bad">{e(err)}</div>' if err else '')
+        page = T("<!doctype html><html lang=\"uk\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"color-scheme\" content=\"light dark\"><title>Вхід · {0}</title><link rel=\"icon\" href=\"/favicon.svg?v={1}\">\n<link rel=\"stylesheet\" href=\"/static/app.css?v={2}\"></head><body>{3}</body></html>", e(BRAND), ASSET_V['/favicon.svg'], ASSET_V['/static/app.css'], body)
+        self.send(200 if not err else 401, page)
+
+    def need_code(self, s, f):
+        """Re-confirmation with a TOTP code for critical actions. 5 wrong codes end the session."""
+        if not str(f.get("code", "")).strip():
+            return time.time() - s.get("fresh", 0) < FRESH_SEC     # an empty field does not count as an attempt
+        with _auth_lock:
+            auth = load_auth()
+            ok = totp_check(auth, str(f.get("code", "")))
+            if ok:
+                save_auth(auth)
+        if ok:
+            s["fresh"], s["code_fails"] = time.time(), 0
+            return True
+        s["code_fails"] = s.get("code_fails", 0) + 1
+        if s["code_fails"] >= CODE_FAILS:
+            SESSIONS.pop(s.get("tok"), None)
+            event(T("Сесію з {0} завершено: {1} невірних кодів підтвердження", s['ip'], CODE_FAILS), "critical", "⛔")
+            raise Redirect("/login")
+        return False
+
+    # -- shared blocks
+    @staticmethod
+    def client_state(c):
+        """(class, state text) for the key tag and the client strip."""
+        if c["status"] == "revoked":
+            return "idle", T("відкликаний")
+        if c.get("suspect"):
+            return "bad", T("під підозрою")
+        if c["status"] == "disabled":
+            r = c.get("disabled_reason")
+            return ("bad" if r == "suspicious" else "idle"), T("вимкнено") + (f": {REASON[r]}" if r in REASON else "")
+        if c.get("guest"):
+            left = c.get("guest_left") or 0
+            if left <= 15 * 60:
+                return "warn", T("гість, лишилось {0}", hm(left))
+            return ("ok" if c["online"] else "idle"), T("гість, ще {0}", hm(left))
+        if c.get("autorevoke_in_days") is not None and c["autorevoke_in_days"] <= 7:
+            return "warn", T("відкликання через {0} дн", c['autorevoke_in_days'])
+        if c.get("rotate_due"):
+            return "warn", T("час змінити ключ")
+        g = c.get("geo") or {}
+        city = g.get("city") or g.get("cc") or ""
+        if c["online"]:
+            return "ok", T("онлайн") + (f", {city}" if city else "")
+        return "idle", T("офлайн, {0}", ago(c['last_seen'])) if c["last_seen"] else T("ще не підключався")
+
+    @staticmethod
+    def ring(num, frac, dashed=False):
+        """Ring around the number: share of days left before auto-revoke."""
+        c = 2 * 3.14159 * 28
+        if dashed:
+            arc = '<circle class="ar" cx="34" cy="34" r="28" stroke-dasharray="3 6"/>'
+        else:
+            arc = (f'<circle class="ar" cx="34" cy="34" r="28" stroke-dasharray="{c * max(frac, .02):.1f} {c:.1f}" '
+                   'transform="rotate(-90 34 34)"/>')
+        return (f'<svg class="rg" viewBox="0 0 68 68" aria-hidden="true"><circle class="tr" cx="34" cy="34" r="28"/>{arc}'
+                f'<text class="ro" x="34" y="42" text-anchor="middle">{e(str(num))}</text></svg>')
+
+    def key_card(self, c):
+        cls, text = self.client_state(c)
+        if c["status"] == "disabled":
+            cls = "bad off" if cls == "bad" else "off"
+        num = c["ip"].rsplit(".", 1)[1]
+        left = c.get("autorevoke_in_days")
+        if c["status"] == "disabled":
+            ring, days = self.ring(num, 0, dashed=True), T("вимкнено")
+        elif c.get("guest"):
+            total = max(1, (c.get("guest_hours") or 1) * 3600)
+            ring = self.ring(num, min(1, (c.get("guest_left") or 0) / total))
+            days = T("гість до {0}", fmt_ts(c['guest_until'])[11:])
+        elif left is not None:
+            ring, days = self.ring(num, max(0, left) / INACTIVE_DAYS), T("{0} з {1} дн", max(0, left), INACTIVE_DAYS)
+        else:
+            ring = self.ring(num, 1)
+            days = T("до {0}", c['expires']) if c.get("expires") else T("без автовідкликання")
+        meta = c.get("note") or (T("адмін") if c.get("admin") else "")
+        why = f'<p class="why">{e(c["suspect"])}</p>' if c.get("suspect") and c["status"] != "revoked" else ""
+        return (f'<a class="k key {cls}" href="/c/{c["name"]}"><div class="top">{ring}'
+                f'<div class="lf"><span>{e(c["ip"])}</span><span>{e(days)}</span></div></div>'
+                f'<div class="nm">{e(c["name"])}</div><div class="mt">{e(meta)}</div>{why}<div class="st">{e(text)}</div></a>')
+
+    @staticmethod
+    def where(site):
+        k, w = site.get("on_kind"), site.get("on")
+        return {"location": site.get("on_title") or w, "client": T("пристрій {0}", w), "vps": "VPS"}.get(k, T("поза мережею"))
+
+    def site_card(self, st):
+        h = st.get("health") or {}
+        cls = "ok" if h.get("ok") else ("bad" if h else "idle")
+        hs = T("{0} мс", h.get('ms')) if h.get("ok") else (T("не відповідає") if h else T("ще не перевірено"))
+        pills = [f'<span class="pill {cls if cls != "idle" else ""}">{e(hs)}</span>']
+        if st.get("public"):
+            pills.append(T("<span class=\"pill warn\">публічний</span>"))
+        pills.append(T("<span class=\"pill\">{0} з доступом</span>", T("усі") if st.get("public") else len(st["access"])))
+        ico = (f'<svg class="pl-ico" viewBox="0 0 44 44" aria-hidden="true"><circle class="pl {cls}" cx="22" cy="22" r="17"/>'
+               f'<circle class="dt {cls}" cx="22" cy="22" r="5"/></svg>')
+        return (f'<a class="k site {cls}" href="/s/{st["name"]}"><div class="top">{ico}<div class="lf">'
+                f'<span>{e(self.where(st))}</span><span>{e(st["backend"].split("://", 1)[-1])}</span></div></div>'
+                f'<div class="nm">{e(st["name"])}</div><div class="pills">{"".join(pills)}</div></a>')
+
+    def events(self, items, empty=T("Подій поки немає.")):
+        if not items:
+            return f'<p class="muted">{empty}</p>'
+        rows, today = [], datetime.now(TZ).date().isoformat()
+        for x in reversed(items):
+            ts = x["ts"]
+            when = ts[11:16] if ts[:10] == today else f"{ts[8:10]}.{ts[5:7]} {ts[11:16]}"
+            cat = x.get("cat", "info")
+            rows.append(f'<div class="ev"><time>{when}</time><div><span class="tag {e(cat)}">{e(CAT.get(cat, cat))}</span>'
+                        f'{e(x["text"])}</div></div>')
+        return '<div class="evs">' + "".join(rows) + "</div>"
+
+    def toggles(self, sites, current):
+        cur = current if isinstance(current, list) else []
+        out = [T("<label class=\"tog all\"><input type=\"checkbox\" name=\"all\" value=\"1\" id=\"all-sites\"{0}><span>Усі сайти, включно з майбутніми</span></label>", " checked" if current == "*" else "")]
+        for st in sites:
+            out.append(f'<label class="tog"><input class="site-cb" type="checkbox" name="site" value="{st["name"]}"'
+                       f'{" checked" if st["name"] in cur else ""}><span>{e(st["name"])}</span></label>')
+        tail = "" if sites else T("<p class=\"small muted\">Сайтів ще немає. <a href=\"/sites\">Додати сайт</a></p>")
+        return f'<div class="togs">{"".join(out)}</div>{tail}'
+
+    @staticmethod
+    def sites_value(f):
+        if f.get("all"):
+            return "*"
+        v = f.get("site", [])
+        v = [v] if isinstance(v, str) else v
+        return ",".join(x for x in v if NAME_RE.match(x)) or "none"
+
+    def act(self, s, args, ok_text):
+        rc, out, err = wg(*args)
+        if rc == 0:
+            last = out.strip().splitlines()[-1] if out.strip() else ""
+            self.flash(s, "ok", ok_text or last or T("Готово"))
+        else:
+            self.flash(s, "bad", err or T("Помилка"))
+        return rc == 0
+
+    # -- charts (SVG rendered on the server: no third-party scripts, CSP stays strict)
+    RANGE_NAMES = (("24h", T("24 год")), ("7d", T("7 днів")), ("30d", T("30 днів")))
+    WEEKDAYS = (T("Пн"), T("Вт"), T("Ср"), T("Чт"), T("Пт"), T("Сб"), T("Нд"))
+
+    def rng(self):
+        r = (getattr(self, "qs", {}) or {}).get("r", ["24h"])[0]
+        return r if r in dict(self.RANGE_NAMES) else "24h"
+
+    def range_tabs(self, base, anchor):
+        cur = self.rng()
+        return '<div class="filters">' + "".join(
+            f'<a class="{"on" if k == cur else ""}" href="{base}?r={k}#{anchor}">{t}</a>' for k, t in self.RANGE_NAMES) + "</div>"
+
+    @staticmethod
+    def nice_max(v):
+        if v <= 0:
+            return 1
+        import math
+        e = 10 ** math.floor(math.log10(v))
+        for m in (1, 2, 2.5, 5, 10):
+            if v <= m * e:
+                return m * e
+        return 10 * e
+
+    def ticks(self, h):
+        """X axis labels in the hub's time zone: [(time, label)]."""
+        frm, to, rng = h["from"], h["to"], h["range"]
+        out = []
+        d = datetime.fromtimestamp(frm, TZ).replace(minute=0, second=0, microsecond=0)
+        from datetime import timedelta
+        if rng == "24h":
+            d = d.replace(hour=d.hour // 6 * 6) + timedelta(hours=6)
+            while d.timestamp() < to:
+                out.append((d.timestamp(), d.strftime("%H:00")))
+                d += timedelta(hours=6)
+        else:
+            d = d.replace(hour=0) + timedelta(days=1)
+            every = 1 if rng == "7d" else 7
+            while d.timestamp() < to:
+                if (d.toordinal() % every) == 0 or every == 1:
+                    out.append((d.timestamp(), f"{self.WEEKDAYS[d.weekday()]} {d.day}" if rng == "7d" else d.strftime("%d.%m")))
+                d += timedelta(days=1)
+        return out
+
+    def chart(self, h, series, kind="line", fmt=str, unit=""):
+        """series: [(key, name, colour class)]. kind: bars (stacked) | line.
+        Two SVG versions: wide and narrow (phone), so axis labels stay readable."""
+        legend = ""
+        if len(series) > 1:
+            legend = '<div class="lg">' + "".join(f'<span><i class="{c}"></i>{e(t)}</span>' for _, t, c in series) + "</div>"
+        return (f'<div class="chart">{legend}{self._chart_svg(h, series, kind, fmt, unit, 640, "wide")}'
+                f'{self._chart_svg(h, series, kind, fmt, unit, 340, "narrow")}</div>')
+
+    def _chart_svg(self, h, series, kind, fmt, unit, W, cls):
+        H, x0, x1, y0, y1 = 156, 46 if W < 400 else 52, W - 6, 10, 132
+        frm, to, step = h["from"], h["to"], h["step"]
+        n = max(1, (to - frm) // step + 1)
+        bw = (x1 - x0) / n
+        data = {k: dict((b, v) for b, v in h["series"].get(k, [])) for k, _, _ in series}
+        buckets = range(frm, frm + n * step, step)
+        if kind == "bars":
+            tot = [sum(data[k].get(b, 0) for k, _, _ in series) for b in buckets]
+        else:
+            tot = [v for k, _, _ in series for v in data[k].values()]
+        top = self.nice_max(max(tot, default=0))
+        Y = lambda v: y1 - (y1 - y0) * min(v, top) / top
+        X = lambda b: x0 + (b - frm) / step * bw
+        g = [f'<svg viewBox="0 0 {W} {H}" class="ch {cls}" role="img" aria-label="{e(", ".join(t for _, t, _ in series))}">']
+        for fr in (0, .5, 1):
+            yy = Y(top * fr)
+            g.append(f'<line class="gl" x1="{x0}" x2="{x1}" y1="{yy:.1f}" y2="{yy:.1f}"/>'
+                     f'<text class="ax" x="{x0 - 6}" y="{yy + 4:.1f}" text-anchor="end">{e(fmt(top * fr))}</text>')
+        tks = self.ticks(h)
+        if W < 400 and len(tks) > 4:
+            tks = tks[::2]
+        for ts, lab in tks:
+            xx = X(ts)
+            if x0 + 10 < xx < x1 - 10:
+                g.append(f'<line class="tk" x1="{xx:.1f}" x2="{xx:.1f}" y1="{y1}" y2="{y1 + 4}"/>'
+                         f'<text class="ax" x="{xx:.1f}" y="{H - 6}" text-anchor="middle">{e(lab)}</text>')
+        if kind == "bars":
+            for b in buckets:
+                base = y1
+                for k, _, c in series:
+                    v = data[k].get(b, 0)
+                    if v <= 0:
+                        continue
+                    hgt = max(1.5, (y1 - y0) * min(v, top) / top)
+                    g.append(f'<rect class="{c}" x="{X(b) + 1:.1f}" y="{base - hgt:.1f}" width="{max(1, bw - 2):.1f}" height="{hgt:.1f}" rx="1"/>')
+                    base -= hgt + 1                   # 1 px gap between stacked parts
+        else:
+            for k, _, c in series:
+                pts, seg = sorted(data[k].items()), []
+                prev = None
+                for b, v in pts:
+                    if prev is not None and b - prev > 2 * step:
+                        seg.append(None)              # a gap where there was no data
+                    seg.append((X(b) + bw / 2, Y(v)))
+                    prev = b
+                d, pen = "", "M"
+                for pt in seg:
+                    if pt is None:
+                        pen = "M"
+                        continue
+                    d += f"{pen}{pt[0]:.1f} {pt[1]:.1f} "
+                    pen = "L"
+                if d:
+                    g.append(f'<path class="cl {c}" d="{d.strip()}"/>')
+        # hover hints: one per time segment
+        for b in buckets:
+            vals = [(t, data[k].get(b)) for k, t, _ in series]
+            if all(v is None for _, v in vals):
+                continue
+            when = datetime.fromtimestamp(b, TZ).strftime("%d.%m %H:%M")
+            tip = when + ": " + ", ".join(f"{t} {fmt(v or 0)}{unit}" for t, v in vals)
+            g.append(f'<rect class="hit" x="{X(b):.1f}" y="{y0}" width="{bw:.1f}" height="{y1 - y0}"><title>{e(tip)}</title></rect>')
+        g.append("</svg>")
+        return "".join(g)
+
+    def strip(self, h, key, kind="status", label=""):
+        """Availability strip: each time segment green, yellow (partial) or red."""
+        return (f'<div class="strip">{self._strip_svg(h, key, kind, label, 640, "wide")}'
+                f'{self._strip_svg(h, key, kind, label, 340, "narrow")}<p class="hint">{e(label)}</p></div>')
+
+    def _strip_svg(self, h, key, kind, label, W, wcls):
+        x0, x1 = (46 if W < 400 else 52), W - 6
+        frm, to, step = h["from"], h["to"], h["step"]
+        n = max(1, (to - frm) // step + 1)
+        bw = (x1 - x0) / n
+        data = dict((b, v) for b, v in h["series"].get(key, []))
+        cells = []
+        for i in range(n):
+            b = frm + i * step
+            v = data.get(b)
+            if v is None:
+                cls = "nd"
+            elif kind == "status":
+                cls = "up" if v >= .999 else ("dn" if v <= .001 else "pt")
+            else:
+                cls = "pr" + str(min(4, int(v * 4 + .999))) if v > 0 else "nd"
+            when = datetime.fromtimestamp(b, TZ).strftime("%d.%m %H:%M")
+            tip = f"{when}: " + (T("немає даних") if v is None else f"{v * 100:.0f}%")
+            cells.append(f'<rect class="sc {cls}" x="{x0 + i * bw:.1f}" y="2" width="{max(1, bw - 1):.1f}" height="16" rx="2"><title>{e(tip)}</title></rect>')
+        vals = list(data.values())
+        pct = f"{sum(vals) / len(vals) * 100:.1f}%" if vals else T("немає даних")
+        return (f'<svg viewBox="0 0 {W} 20" class="{wcls}" role="img" aria-label="{e(label)}: {pct}">'
+                f'<text class="ax" x="{x0 - 6}" y="14" text-anchor="end">{pct}</text>{"".join(cells)}</svg>')
+
+    def hist(self, *keys):
+        try:
+            return wgj("history", ",".join(keys), "--range", self.rng())
+        except (RuntimeError, ValueError):
+            return {"range": self.rng(), "step": 3600, "from": int(time.time()) - 86400, "to": int(time.time()),
+                    "series": {k: [] for k in keys}}
+
+    def availability(self, base, name):
+        h = self.hist(f"up:{name}", f"ms:{name}")
+        return (T("<section id=\"av\"><h2>Доступність і швидкість</h2>{0}<div class=\"panel\">", self.range_tabs(base, "av"))
+                + self.strip(h, f"up:{name}", "status", T("частка перевірок, коли ціль відповідала"))
+                + self.chart(h, [(f"ms:{name}", T("відповідь"), "c1")], "line", lambda v: f"{v:.0f}", T(" мс"))
+                + T("<p class=\"hint\">Час відповіді, мс. Перевірка щохвилини з VPS.</p></div></section>"))
+
+    def visits_block(self, rows, who_col=True):
+        if not rows:
+            return T("<p class=\"muted\">За 30 днів звернень не було.</p>")
+        out = []
+        for r in rows:
+            who = r["who"]
+            if who.startswith("web:"):
+                label = T("інтернет, {0}", who[4:])
+            elif r.get("who_kind") == "location":
+                label = T("{0}, уся мережа", r.get('who_title') or who)
+            else:
+                label = who
+            first = (f'<a href="/c/{who}">{e(label)}</a>' if who_col and r.get("who_kind") == "client"
+                     else e(label)) if who_col else f'<a href="/s/{r["site"]}">{e(r["site"])}</a>'
+            den = T(", <span class=\"bad-t\">відмов {0}</span>", r["denied"]) if r["denied"] else ""
+            out.append(T("<div class=\"ln\"><span class=\"when\">{0}</span><span class=\"muted\">{1} запитів{2}, днів {3}</span><span class=\"muted small\">{4}</span></div>", first, r["n"], den, r["days"], fmt_ts(r["last"])))
+        return '<div class="lines">' + "".join(out) + "</div>"
+
+    # -- orbital network map
+
+    def map_model(self, st):
+        """A shared model for the map and the mobile list: planets (locations, "other") and devices."""
+        topo = st["topology"]
+        planets = []
+        for l in st["locations"]:
+            n = l["name"]
+            cls = {"ok": "ok", "warn": "warn", "down": "bad"}[l["state"]]
+            sub = (T("зв'язок {0}", ago(l.get('handshake'))) if l["state"] != "down" and l.get("handshake") else
+                   T("роутер ще не підключався") if not l.get("handshake") else T("немає зв'язку"))
+            planets.append({"t": l.get("title") or n, "s": sub, "cls": cls, "items": topo["locations"].get(n, []),
+                            "href": f"/l/{n}"})
+        other = topo["vps"] + topo["other"]
+        if other:
+            bad = any(x["ok"] is False for x in other)
+            planets.append({"t": T("Інші сайти"), "s": T("на VPS і поза мережею"), "cls": "bad" if bad else "ok", "items": other,
+                            "href": "/sites"})
+        return planets, topo["devices"]
+
+    @staticmethod
+    def fold_svc(items):
+        """For the map: sites separately, and all TCP services of a location as one "services · N" square."""
+        svc = [x for x in items if x.get("svc")]
+        if len(svc) < 2:
+            return items
+        oks = [x["ok"] for x in svc]
+        agg = {"name": T("сервіси · {0}", len(svc)), "svc": True, "agg": True, "public": False, "ms": None,
+               "ok": False if False in oks else (True if all(oks) else None)}
+        return [x for x in items if not x.get("svc")] + [agg]
+
+    @staticmethod
+    def item_cls(it):
+        return "ok" if it["ok"] else ("bad" if it["ok"] is False else "idle")
+
+    @staticmethod
+    def item_info(it):
+        return ((T("{0} мс", it['ms']) if it["ok"] else T("не відповідає") if it["ok"] is False else "")
+                + (T(", публ.") if it.get("public") else "") + (T(", порт {0}", it['port']) if it.get("port") else ""))
+
+    def item_mark(self, it, x, y, r=9):
+        """Site: a circle; TCP service: a rounded square."""
+        cls = self.item_cls(it)
+        if it.get("svc"):
+            return f'<rect class="dt {cls}" x="{x - r:.0f}" y="{y - r:.0f}" width="{2 * r}" height="{2 * r}" rx="4"/>'
+        return f'<circle class="dt {cls}" cx="{x:.0f}" cy="{y:.0f}" r="{r}"/>'
+
+    def netmap(self, st):
+        import math
+        planets, devs = self.map_model(st)
+        planets = [{**pl, "items": self.fold_svc(pl["items"])} for pl in planets]
+        W, H, hx, hy = 1144, 540, 572, 258
+        IRX, IRY, ORX, ORY = 270, 150, 450, 222
+
+        def cut(t, n):
+            return t if len(t) <= n else t[:n - 1] + "…"
+
+        out = [T("<svg viewBox=\"0 0 {0} {1}\" role=\"img\" aria-label=\"Схема мережі: хаб, локації і пристрої\">", W, H),
+               f'<ellipse class="ring" cx="{hx}" cy="{hy}" rx="{IRX}" ry="{IRY}"/>',
+               f'<ellipse class="ring outer" cx="{hx}" cy="{hy}" rx="{ORX}" ry="{ORY}"/>']
+        # planets on the inner orbit: the first two at the top left and top right, the rest at the bottom
+        slots = [202, 338, 90, 250, 290, 140, 40]
+        placed = []
+        for i, pl in enumerate(planets):
+            a = math.radians(slots[i % len(slots)])
+            placed.append((pl, hx + IRX * math.cos(a), hy + IRY * math.sin(a)))
+        for pl, x, y in placed:
+            out.append(f'<line class="spoke {pl["cls"]}" x1="{hx}" y1="{hy}" x2="{x:.0f}" y2="{y:.0f}"/>')
+        for pl, x, y in placed:
+            items = pl["items"][:6]
+            up = y < hy
+            k = len(items)
+
+            def spread(lo, hi):
+                return [(lo + hi) / 2] if k == 1 else [lo + (hi - lo) * i / (k - 1) for i in range(k)]
+            if up:        # a top planet: name above it, satellites fanned out below
+                angs, rad = spread(35, 145) if k > 1 else [90], 80
+            elif x < hx - 40:
+                angs, rad = spread(150, 215), 76
+            else:
+                angs, rad = spread(-30, 40), 76
+            g = []
+            for j, (it, ad) in enumerate(zip(items, angs)):
+                a = math.radians(ad)
+                rr = rad + (30 * (j % 2) if k <= 4 else 26 * (j % 3)) if up else rad   # in tiers: labels do not overlap
+                mx, my = x + rr * math.cos(a), y + rr * math.sin(a)
+                if up:
+                    anc, dx, dy = "middle", 0, 26
+                else:
+                    anc = "end" if math.cos(a) < 0 else "start"
+                    dx, dy = (-15 if anc == "end" else 15), 5
+                # above the planet only the name (ms in the hint), at the side also the state
+                info = "" if (up and it["ok"] is not False) or it.get("agg") else self.item_info(it)
+                g.append(f'<line class="tether" x1="{x:.0f}" y1="{y:.0f}" x2="{mx:.0f}" y2="{my:.0f}"/>'
+                         f'<a href="{item_href(it)}"><title>{e(it["name"] + ": " + (self.item_info(it) or T("ще не перевірено")))}</title>{self.item_mark(it, mx, my)}'
+                         f'<text class="mn" x="{mx + dx:.0f}" y="{my + dy:.0f}" text-anchor="{anc}">{e(cut(it["name"], 14))}'
+                         + (f' <tspan class="mi">{e(info)}</tspan>' if info else "") + "</text></a>")
+            if len(pl["items"]) > 6:
+                g.append(T("<text class=\"ps\" x=\"{0:.0f}\" y=\"{1:.0f}\" text-anchor=\"middle\">і ще {2} на сторінці «Сайти»</text>", x, y + (150 if up else 98), len(pl["items"]) - 6))
+            ty = y - 64 if up else y + 62
+            g.append(f'<a href="{pl["href"]}"><title>{e(pl["t"])}</title><circle class="pl {pl["cls"]}" cx="{x:.0f}" cy="{y:.0f}" r="38"/>'
+                     f'<circle class="dt {pl["cls"]}" cx="{x:.0f}" cy="{y:.0f}" r="7"/>'
+                     f'<text class="pt" x="{x:.0f}" y="{ty:.0f}" text-anchor="middle">{e(pl["t"])}</text>'
+                     f'<text class="ps" x="{x:.0f}" y="{ty + 18:.0f}" text-anchor="middle">{e(pl["s"])}</text></a>')
+            out.append("".join(g))
+        # devices on the outer orbit: two arcs, right and left
+        n = len(devs)
+        right = devs[:(n + 1) // 2]
+        left = devs[(n + 1) // 2:]
+
+        def arc(lo, hi, k):
+            if k == 1:
+                return [(lo + hi) / 2]
+            return [lo + (hi - lo) * i / (k - 1) for i in range(k)]
+        angs = arc(-52, 52, len(right)) + arc(128, 232, len(left))
+        labels = n <= 24
+        for d, ang in zip(right + left, angs):
+            a = math.radians(ang)
+            x, y = hx + ORX * math.cos(a), hy + ORY * math.sin(a)
+            cls = {"ok": "ok", "warn": "warn", "bad": "bad", "off": "off"}.get(d["state"], "idle")
+            halo = f'<circle class="dt {cls} halo" cx="{x:.0f}" cy="{y:.0f}" r="17"/>' if cls in ("ok", "warn", "bad") else ""
+            r_side = math.cos(a) > 0
+            name = cut(d["name"], 18)
+            names = ", ".join(cut(it["name"], 12) for it in d["sites"][:3]) + (" …" if len(d["sites"]) > 3 else "")
+            sub = T("на пристрої: {0}", names) if d["sites"] else ""
+            # label width (roughly): if it would go past the edge of the map at the side, put it under the dot
+            need = max(len(name) * 8.6, len(sub) * 6.6) + 30
+            if (x + need > W - 6) if r_side else (x - need < 6):
+                tx, ty, anc = x, y + 34, "middle"
+            else:
+                tx, ty, anc = x + (22 if r_side else -22), y + 5, "start" if r_side else "end"
+            lab = (f'<text class="dn" x="{tx:.0f}" y="{ty:.0f}" text-anchor="{anc}">{e(name)}</text>'
+                   if labels or cls in ("bad", "warn") else "")
+            g = [f'<a href="/c/{d["name"]}"><title>{e(d["name"])}</title>{halo}<circle class="dt dv {cls}" cx="{x:.0f}" cy="{y:.0f}" r="9"/>{lab}</a>']
+            # sites living on a device: a second line under the name
+            if sub and lab:
+                bad = any(it["ok"] is False for it in d["sites"])
+                g.append(f'<text class="mi{" bad" if bad else ""}" x="{tx:.0f}" y="{ty + 17:.0f}" text-anchor="{anc}">{e(sub)}</text>')
+            out.append("".join(g))
+        on = sum(d["online"] for d in devs)
+        out.append(T("<text class=\"ol\" x=\"{0}\" y=\"{1}\" text-anchor=\"middle\">зовнішня орбіта: пристрої з ключами, {2}, онлайн {3}</text>", hx, hy + ORY + 40, n, on))
+        ok = st["wg0"] == "ok" and st["caddy"] == "ok"
+        out.append(T("<circle class=\"hubr\" cx=\"{0}\" cy=\"{1}\" r=\"64\"/><circle class=\"hubc\" cx=\"{2}\" cy=\"{3}\" r=\"52\"/><text class=\"ht\" x=\"{4}\" y=\"{5}\" text-anchor=\"middle\">VPS хаб</text><text class=\"hs\" x=\"{6}\" y=\"{7}\" text-anchor=\"middle\">{8}</text>", hx, hy, hx, hy, hx, hy + 2, hx, hy + 20, T("wg0 і Caddy") if ok else T("є збій")))
+        out.append("</svg>")
+        return "".join(out)
+
+    def netlist(self, st):
+        """Phone: the same model as a list, no map."""
+        planets, devs = self.map_model(st)
+        rows = []
+        for pl in planets:
+            mm = "".join(f'<a class="mm {self.item_cls(it)}{" svc" if it.get("svc") else ""}" href="{item_href(it)}">{e(it["name"])}</a>' for it in pl["items"])
+            rows.append(f'<div class="sy {pl["cls"]}"><span class="dot"></span><div><b><a href="{pl["href"]}">{e(pl["t"])}</a></b><small>{e(pl["s"])}</small>'
+                        f'<div class="mms">{mm}</div></div></div>')
+        hosted = [(d, it) for d in devs for it in d["sites"]]
+        on = sum(d["online"] for d in devs)
+        att = sum(d["state"] in ("bad", "warn") for d in devs)
+        cls = "warn" if att else ("ok" if on else "off")
+        mm = "".join(T("<a class=\"mm {0}{1}\" href=\"{2}\">{3} на {4}</a>", self.item_cls(it), " svc" if it.get("svc") else "", item_href(it), e(it["name"]), e(d["name"])) for d, it in hosted)
+        rows.append(T("<div class=\"sy {0}\"><span class=\"dot\"></span><div><b>Пристрої · {1}</b><small>онлайн {2}", cls, len(devs), on) + (T(", увага {0}", att) if att else "") + f'</small><div class="mms">{mm}</div></div></div>')
+        return "".join(rows)
+
+    # -- overview
+    def page_overview(self, s, flt=""):
+        prefetch(("status",), ("list",), ("log", "-n", "8"))
+        st = wgj("status")
+        clients = wgj("list")
+        log = wgj("log", "-n", "8")
+        cls, title, issues = self.sys_state(st)
+        topo = st["topology"]
+        devs = topo["devices"]
+        on = sum(d["online"] for d in devs)
+        locs = st["locations"]
+        locs_ok = sum(1 for l in locs if l["state"] != "down")
+        nsites = sum(len(v) for v in topo["locations"].values()) + len(topo["vps"]) + len(topo["other"]) + \
+            sum(len(d["sites"]) for d in devs)
+        okn = sum(1 for v in topo["locations"].values() for x in v if x["ok"]) + \
+            sum(1 for x in topo["vps"] + topo["other"] if x["ok"]) + sum(1 for d in devs for x in d["sites"] if x["ok"])
+        if cls == "s-ok":
+            lead = ((T("Локацій на зв'язку: {0} з {1}. ", locs_ok, len(locs)) if locs else "") + T("{0} з {1} сайтів і сервісів відповідають, {2} {3} зараз у мережі.", okn, nsites, on, T("пристрій") if on == 1 else T("пристрої") if 1 < on < 5 else T("пристроїв")))
+            acts = T("<a class=\"b fill\" href=\"/new\">Видати ключ</a><a class=\"b\" href=\"/sites#add\">Додати сайт</a>")
+        else:
+            lead = "; ".join(e(x) for x in issues[:4]) + (T(" і ще {0}", len(issues) - 4) if len(issues) > 4 else "") + \
+                T(". Решта працює.")
+            first = (st["suspects"] or st["expiring"] or [None])[0]
+            acts = (T("<a class=\"b fill\" href=\"/c/{0}\">Переглянути {1}</a>", first, e(first)) if first else
+                    T("<a class=\"b fill\" href=\"/log\">Відкрити журнал</a>")) + T("<a class=\"b\" href=\"/new\">Видати ключ</a>")
+        facts = [(T("{0} з {1}", on, len(devs)), T("пристроїв онлайн")),
+                 (T("{0} з {1}", locs_ok, len(locs)) if locs else "0", T("локацій на зв'язку")),
+                 (T("{0} з {1}", okn, nsites), T("сайти й сервіси відповідають")),
+                 (T("{0} дн", st['cert_days']) if st.get("cert_days") is not None else "-", T("сертифікат дійсний"))]
+        hero = self.hero(title, lead, acts, facts, chip=STATE_WORD[cls])
+        live = [c for c in clients if c["status"] != "revoked"]
+        groups = {"": live, "online": [c for c in live if c["online"]],
+                  "attn": [c for c in live if self.client_state(c)[0] in ("bad", "warn")],
+                  "off": [c for c in live if c["status"] == "disabled"]}
+        flt = flt if flt in groups else ""
+        fl = "".join(f'<a class="{"on" if flt == k else ""}" href="/{"?f=" + k if k else ""}">{t} {len(groups[k])}</a>'
+                     for k, t in (("", T("Усі")), ("online", T("Онлайн")), ("attn", T("Увага")), ("off", T("Вимкнені"))))
+        cards = "".join(self.key_card(c) for c in groups[flt])
+        if not flt:
+            cards += T("<a class=\"k new\" href=\"/new\">+ Видати ключ</a>")
+        body = self.first_steps(locs, nsites, live) + (T("<section class=\"map-wrap\"><h2>Мережа</h2><div class=\"map\">{0}</div></section><section class=\"msys\"><h2>Мережа</h2>{1}</section><section><h2>Ключі <small>{2} видано. Кільце показує, скільки днів лишилось до автовідкликання</small></h2><div class=\"filters\">{3}</div><div class=\"keys\">{4}</div></section><section><h2>Останнє <a href=\"/log\">увесь журнал</a></h2>{5}</section>", self.netmap(st), self.netlist(st), len(live), fl, cards or T("<p class=muted>Нічого не знайдено.</p>"), self.events(log)))
+        return self.layout(s, T("Огляд"), hero, body, "home", cls, refresh=True,
+                           fab=T("<a class=\"fab\" href=\"/new\">Видати ключ</a>"))
+
+    @staticmethod
+    def first_steps(locs, nsites, live):
+        """Setup checklist on a fresh hub; disappears once there is a location, a site and a key."""
+        steps = [(bool(locs), "/locations", T("Додайте локацію"), T("Роутер у вашій мережі, через який хаб бачить сайти.")),
+                 (nsites > 0, "/sites#add", T("Додайте сайт"), T("Сервіс у мережі локації отримає адресу на вашому домені.")),
+                 (bool(live), "/new", T("Видайте ключ"), T("Конфіг WireGuard для телефона чи ноутбука з доступом до вибраних сайтів."))]
+        if all(done for done, *_ in steps):
+            return ""
+        items = "".join(f'<a class="step{" done" if done else ""}" href="{href}"><b>{i}</b><span><strong>{e(t)}</strong>'
+                        f'<small>{e(d)}</small></span></a>' for i, (done, href, t, d) in enumerate(steps, 1))
+        extra = T("<p class=\"muted small\">Потім: <a href=\"/settings\">сповіщення в Signal</a> і <a href=\"/server\">резервні копії</a>.</p>")
+        return T("<section><h2>Перші кроки</h2><div class=\"steps\">{0}</div>{1}</section>", items, extra)
+
+    # -- client
+    def page_client(self, s, name, method, f):
+        if method == "POST":
+            a = f.get("act", "")
+            simple = {"disable": (["disable", name], T("Доступ вимкнено")),
+                      "block": (["disable", name, "--reason", "suspicious"], T("Заблоковано")),
+                      "enable": (["enable", name], T("Доступ увімкнено")),
+                      "extend": (["extend", name], T("Відлік автовідкликання почато заново")),
+                      "trust": (["trust", name], T("Позначено як довірене")),
+                      "clear": (["clear", name], T("Позначку знято")),
+                      "reissue": (["reissue", name], T("Видано новий конфіг, старий більше не працює")),
+                      "guest_more": (["extend", name, "--hours", "2"], "")}
+            if a in simple:
+                if self.act(s, *simple[a]) and a == "reissue":
+                    s["made"][name] = time.time()
+            elif a == "save":
+                # --option=value: user text never becomes a separate wgctl option
+                args = ["set", name, opt("note", f.get("note", "")), opt("notes", f.get("notes", "")),
+                        opt("phone", f.get("phone", "") or "none"), opt("expires", f.get("expires", "") or "none"),
+                        "--autorevoke", "on" if f.get("autorevoke") else "off"]
+                self.act(s, args, T("Збережено"))
+            elif a == "sites":
+                self.act(s, ["set", name, "--sites", self.sites_value(f)], T("Права на сайти збережено"))
+            elif a == "guest_end":
+                try:
+                    is_guest = wgj("show", name).get("guest")
+                except RuntimeError:
+                    is_guest = False
+                if is_guest and self.act(s, ["revoke", name, "-y"], T("Гостьовий доступ завершено")):
+                    raise Redirect("/")
+            elif a in ("admin_on", "admin_off", "revoke"):
+                if not self.need_code(s, f):
+                    self.flash(s, "bad", T("Потрібен правильний код із застосунку"))
+                elif a == "revoke":
+                    if self.act(s, ["revoke", name, "-y"], T("Доступ відкликано назавжди")):
+                        raise Redirect("/")
+                else:
+                    self.act(s, ["set", name, "--admin", "on" if a == "admin_on" else "off"], T("Права адміна оновлено"))
+            raise Redirect(f"/c/{name}")
+        prefetch(("show", name), ("site", "list"), ("log", "-n", "15", "--client", name),
+                 ("history", f"tx:{name},rx:{name},on:{name}", "--range", self.rng()), ("visits", "--client", name))
+        try:
+            c = wgj("show", name)
+        except RuntimeError as ex:
+            return self.layout(s, name, self.hero(T("Ключ не знайдено"), e(str(ex)), small=True), "", "home")
+        sites = wgj("site", "list")
+        log = wgj("log", "-n", "15", "--client", name)
+        cls, text = self.client_state(c)
+        live = c["status"] != "revoked"
+        g = c.get("geo") or {}
+        place_ = " ".join(x for x in (g.get("country", ""), g.get("city", "")) if x) or "-"
+        if c.get("suspect") and live:
+            lead = T("Кандидат на блокування. Причина: {0}.", e(c['suspect']))
+        elif c["status"] == "disabled":
+            lead = T("Доступ вимкнено ({0}). Пристрій бачить сторінку «Доступ вимкнено».", e(REASON.get(c.get('disabled_reason'), T("вручну"))))
+        elif not live:
+            lead = T("Відкликано {0}. Конфіг більше не працює.", fmt_ts(c.get('revoked_at')))
+        elif c.get("guest"):
+            lead = (T("Гостьовий доступ до {0} (ще {1}). Потім ключ відкличеться сам.", fmt_ts(c['guest_until'])[11:], hm(c['guest_left'])) + (f" {e(c['note'])}." if c.get("note") else ""))
+        else:
+            lead = e(text[:1].upper() + text[1:]) + "." + (f" {e(c['note'])}." if c.get("note") else "")
+        acts = ""
+        if live and c.get("guest") and not c.get("suspect"):
+            acts += self.bform(s, "guest_more", T("Продовжити на 2 год"), "b fill")
+            acts += self.bform(s, "guest_end", T("Завершити зараз"), "b", T("Завершити гостьовий доступ? Ключ одразу перестане працювати."))
+        elif live:
+            if c.get("suspect"):
+                acts += self.bform(s, "block", T("Заблокувати"), "b fill") + self.bform(s, "trust", T("Це я, довіряти")) + \
+                    self.bform(s, "clear", T("Зняти позначку"))
+            elif c["status"] == "active":
+                acts += self.bform(s, "extend", T("Продовжити на 60 дн"), "b fill") + self.bform(s, "disable", T("Вимкнути"))
+            else:
+                acts += self.bform(s, "enable", T("Увімкнути"), "b fill")
+            acts += self.bform(s, "reissue", T("Перевидати конфіг"), "b", T("Старий конфіг перестане працювати. Продовжити?"))
+        ar = (T("через {0} дн", c['autorevoke_in_days']) if c.get("autorevoke_in_days") is not None
+              else (T("вимкнено") if not c.get("autorevoke") else "-"))
+        facts = [(c["ip"], T("адреса у VPN")), (ago(c["last_seen"]) if c["last_seen"] else T("ніколи"), T("останнє підключення")),
+                 (place_, T("звідки")), (c.get("expires") or ar, T("термін дії") if c.get("expires") else T("автовідкликання"))]
+        if c.get("guest"):
+            facts[3] = (hm(c["guest_left"]), T("до кінця доступу"))
+        hero = self.hero(name, lead, acts, facts, chip=text[:1].upper() + text[1:])
+        state = {"ok": "s-ok", "warn": "s-warn", "bad": "s-bad"}.get(cls, "s-idle")
+        cs = self.csrf(s)
+        parts = []
+        if c.get("rotate_due"):
+            parts.append(T("<section><div class=\"note warn\">Ключ не змінювався {0} дн (нагадування раз на {1} дн). Перевидайте конфіг і передайте новий файл власнику пристрою: старий одразу перестане працювати.<div class=\"acts\">{2}</div></div></section>", c["rotate_age"], c["rotate_days"], self.bform(s, "reissue", T("Перевидати конфіг"), "btn pri", T("Старий конфіг перестане працювати. Продовжити?"))))
+        if live:
+            conf = c.get("conf_file")
+            if conf:
+                grace = self.conf_grace(s, name, c)
+                hint = (T("Ключ щойно видано: файл і QR доступні без коду ще кілька хвилин.") if grace else
+                        T("Файл містить приватний ключ пристрою, тому потрібен код із застосунку. Кожне відкриття пишеться в журнал."))
+                confh = (f'<p class="muted small">{hint}</p><form method="post" action="/c/{name}/conf" class="row">{cs}'
+                         + ("" if grace else self.code_field("cc"))
+                         + T("<button class=\"btn pri\" name=\"act\" value=\"file\">Завантажити .conf</button><button class=\"btn\" name=\"act\" value=\"qr\">Показати QR</button></form><p class=\"muted small\">Файл на сервері: {0}</p>", e(conf)))
+            else:
+                confh = T("<p class=\"muted\">Конфіг не збережено. Натисніть «Перевидати конфіг», щоб створити новий.</p>")
+            parts.append(T("<section><h2>Конфіг</h2><div class=\"panel\">{0}</div></section>", confh))
+            parts.append(T("<section><h2>Сайти</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"sites\">\n{1}<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>", cs, self.toggles(sites, c['sites'])))
+            if c.get("services"):
+                rows = "".join(f'<div class="ln"><span class="when"><a href="/t/{x["name"]}">{e(x["name"])}</a></span>'
+                               f'<span class="mono muted">{e(x["name"])}.{DOMAIN}:{x["port"]}</span>'
+                               f'<span class="muted small">{e(x["target"])}</span></div>' for x in c["services"])
+                parts.append(T("<section><h2>TCP-сервіси</h2><div class=\"lines\">{0}</div></section>", rows))
+        dl = (T("<dl class=\"kv\"><dt>Реальна IP</dt><dd class=\"mono\">{0}</dd><dt>Місцезнаходження</dt><dd>{1}{2}{3}{4}</dd><dt>Довірені країни</dt><dd>{5}</dd><dt>Трафік</dt><dd>отримано {6}, надіслано {7}</dd><dt>Створено</dt><dd>{8}</dd><dt>Ключ змінено</dt><dd>{9} ({10} дн тому)</dd><dt>Доступ до панелі</dt><dd>{11}</dd></dl>", e((c.get("endpoint") or "-").rsplit(":", 1)[0]), e(place_), (", " + e(g["org"])) if g.get("org") else "", T(" (хостинг або VPN)") if g.get("hosting") else "", " (Tor)" if g.get("tor") else "", e(", ".join(c.get("countries") or []) or "-"), human(c["rx"]), human(c["tx"]), fmt_ts(c["created"]), fmt_ts(c.get("rotated")), c.get("rotate_age", 0), T("так") if c.get("admin") else T("ні")))
+        parts.append(T("<section><h2>Відомості</h2><div class=\"panel\">{0}</div></section>", dl))
+        h = self.hist(f"tx:{name}", f"rx:{name}", f"on:{name}")
+        parts.append(T("<section id=\"act\"><h2>Активність</h2>{0}<div class=\"panel\">", self.range_tabs(f"/c/{name}", "act"))
+                     + self.chart(h, [(f"tx:{name}", T("до пристрою"), "c1"), (f"rx:{name}", T("від пристрою"), "c2")], "bars", human)
+                     + self.strip(h, f"on:{name}", "presence", T("частка часу, коли пристрій був у мережі"))
+                     + "</div></section>")
+        try:
+            vrows = wgj("visits", "--client", name)["rows"]
+        except (RuntimeError, ValueError, KeyError):
+            vrows = []
+        parts.append(T("<section><h2>Відкривав сайти <small>за 30 днів</small></h2>{0}</section>", self.visits_block(vrows, who_col=False)))
+        if live:
+            parts.append(T("<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"n\">Примітка</label><input type=\"text\" id=\"n\" name=\"note\" maxlength=\"80\" value=\"{1}\"></div>\n<div><label class=\"f\" for=\"ph\">Телефон для сповіщень</label><input type=\"tel\" id=\"ph\" name=\"phone\" placeholder=\"+380671234567\" value=\"{2}\"></div>\n<div><label class=\"f\" for=\"ex\">Термін дії (порожньо = без обмеження)</label><input type=\"date\" id=\"ex\" name=\"expires\" value=\"{3}\"></div>\n<div><label class=\"f\">&nbsp;</label><label class=\"check\"><input type=\"checkbox\" name=\"autorevoke\" value=\"1\"{4}>Автовідкликання після 60 дн без підключень</label></div></div>\n<label class=\"f\" for=\"nt\">Нотатки</label><textarea id=\"nt\" name=\"notes\" maxlength=\"4000\">{5}</textarea>\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form></div></section>", cs, e(c.get('note') or ''), e(c.get('phone') or ''), e(c.get('expires') or ''), ' checked' if c.get('autorevoke') else '', e(c.get('notes') or '')))
+        hist = c.get("endpoints") or []
+        if hist:
+            rows = "".join(f'<div class="ln"><span class="when muted">{fmt_ts(x["ts"])}</span><span class="mono">{e(x["ip"])}</span>'
+                           f'<span class="muted">{e(" ".join(v for v in (x.get("cc", ""), x.get("city", "")) if v) or T("невідомо"))}'
+                           f'{(", " + e(x["org"])) if x.get("org") else ""}</span></div>' for x in reversed(hist[-15:]))
+            parts.append(T("<section><h2>Історія адрес</h2><div class=\"lines\">{0}</div></section>", rows))
+        parts.append(T("<section><h2>Події <a href=\"/log?client={0}\">усі</a></h2>{1}</section>", name, self.events(log)))
+        if live and not c.get("guest"):
+            adm = "admin_off" if c.get("admin") else "admin_on"
+            parts.append(T("<section><h2>Небезпечні дії</h2><div class=\"panel\"><p class=\"pstat {5}\">{6}</p><p class=\"muted small\">Потрібен код із застосунку.</p>\n<form method=\"post\" class=\"row\">{0}{1}\n<button class=\"btn\" name=\"act\" value=\"{2}\">{3}</button>\n<button class=\"btn danger\" name=\"act\" value=\"revoke\" data-confirm=\"Відкликати {4} назавжди? Конфіг перестане працювати.\">Відкликати назавжди</button></form></div></section>", cs, self.code_field('cd'), adm, T("Забрати доступ до панелі") if c.get('admin') else T("Дати доступ до панелі"), e(name),
+                           "on" if c.get("admin") else "off",
+                           T("Доступ до панелі: є. Цей пристрій може відкривати панель.") if c.get("admin") else
+                           T("Доступ до панелі: немає.")))
+        return self.layout(s, name, hero, "".join(parts), "home", state)
+
+    @staticmethod
+    def conf_grace(s, name, c):
+        """A key created or reissued in this session without panel access is shown without a code."""
+        return not c.get("admin") and time.time() - s["made"].get(name, 0) < CONF_GRACE
+
+    def conf_out(self, s, name, f):
+        """Config and QR contain a private key: POST only, a TOTP code (or just issued), logged."""
+        try:
+            c = wgj("show", name)
+        except RuntimeError:
+            raise Redirect("/")
+        if not self.conf_grace(s, name, c) and not self.need_code(s, f):
+            self.flash(s, "bad", T("Щоб отримати конфіг, потрібен правильний код із застосунку"))
+            raise Redirect(f"/c/{name}")
+        kind = "qr" if f.get("act") == "qr" else "file"
+        if kind == "file":
+            rc, out, err = wg("conf", name)
+            if rc != 0:
+                self.flash(s, "bad", err)
+                raise Redirect(f"/c/{name}")
+            event(T("Завантажено конфіг {0} з панелі ({1})", name, s['ip']), "warning", "📥")
+            return self.send(200, out, "application/octet-stream",
+                             {"Content-Disposition": f'attachment; filename="{name}.conf"'})
+        rc, svg, err = wg("qr", name, "--svg")
+        if rc != 0 or "<svg" not in svg:
+            self.flash(s, "bad", err or T("Не вдалося створити QR"))
+            raise Redirect(f"/c/{name}")
+        event(T("Показано QR конфігу {0} у панелі ({1})", name, s['ip']), "warning", "📱")
+        hero = self.hero(T("QR для {0}", name), T("Відскануйте в застосунку WireGuard: «Додати тунель» → «Сканувати QR». QR містить приватний ключ: не показуйте його стороннім і закрийте сторінку після сканування."),
+                         T("<a class=\"b fill\" href=\"/c/{0}\">Готово</a>", name), small=True)
+        body = f'<section><div class="panel qrbox"><div class="qr">{svg[svg.find("<svg"):]}</div></div></section>'
+        return self.send(200, self.layout(s, f"QR {name}", hero, body, "home"))
+
+    # -- locations
+    LOC_STATE = {"ok": ("ok", T("на зв'язку")), "warn": ("warn", T("затримка зв'язку")), "down": ("bad", T("немає зв'язку"))}
+
+    def loc_lead(self, l):
+        cls, text = self.LOC_STATE.get(l["state"], ("idle", l["state"]))
+        when = T("останній зв'язок {0}", ago(l["handshake"])) if l.get("handshake") else T("роутер ще не підключався")
+        return cls, text, when
+
+    def page_locations(self, s, method, f):
+        if method == "POST" and f.get("act") == "add":
+            name = norm_name(f.get("name", ""))
+            if not NAME_RE.match(name):
+                self.flash(s, "bad", T("Ім'я локації: малі латинські літери, цифри, дефіс"))
+            elif not self.need_code(s, f):
+                self.flash(s, "bad", T("Потрібен правильний код із застосунку"))
+            elif self.act(s, ["location", "add", name, opt("title", f.get("title", "")), opt("networks", f.get("networks", "")),
+                              *(["--panel"] if f.get("panel") else [])], T("Локацію додано. Налаштуйте роутер за конфігом нижче.")):
+                s["made"][f"loc:{name}"] = time.time()
+                raise Redirect(f"/l/{name}")
+            raise Redirect("/locations")
+        locs = wgj("location", "list")
+        cs = self.csrf(s)
+        cards = []
+        for l in locs:
+            cls, text, when = self.loc_lead(l)
+            cards.append(f'<a class="ln" href="/l/{l["name"]}"><span class="when">{dot(cls)} {e(l["title"])}</span>'
+                         f'<span class="muted">{e(", ".join(l["networks"]) or T("мережі не задано"))}</span>'
+                         f'<span class="muted small">{e(text)}, {e(when)}</span></a>')
+        lst = ('<div class="lines">' + "".join(cards) + "</div>") if cards else \
+            T("<div class=\"note\">Локацій ще немає. Локація — це роутер (вдома, в офісі, будь-де), через який хаб бачить мережу за ним і сайти в ній. Додайте першу нижче.</div>")
+        down = sum(1 for l in locs if l["state"] == "down")
+        hero = self.hero(T("Локації"), T("Роутери, через які хаб бачить ваші мережі: {0}. Без зв'язку: {1}.", len(locs), down) if locs
+                         else T("Додайте роутер, щоб хаб бачив сайти у вашій мережі."), small=True)
+        form = T("<section><h2>Нова локація</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"add\">\n<div class=\"g2\"><div><label class=\"f\" for=\"ln\">Ім'я латиницею, напр. home, office</label><input type=\"text\" id=\"ln\" name=\"name\" required data-name maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{1}\"></div>\n<div><label class=\"f\" for=\"lt\">Назва в панелі</label><input type=\"text\" id=\"lt\" name=\"title\" maxlength=\"80\" placeholder=\"Дім\"></div></div>\n<label class=\"f\" for=\"lnet\">Мережі за роутером (через кому)</label><input type=\"text\" id=\"lnet\" name=\"networks\" placeholder=\"192.168.1.0/24\">\n<p class=\"hint\">Хаб отримає доступ до цих мереж через тунель. Що саме з них можна відкрити, обмежує брандмауер роутера.</p>\n<label class=\"check\"><input type=\"checkbox\" name=\"panel\" value=\"1\">Пускати мережу локації в цю панель</label>\n<div class=\"row\">{2}<button class=\"btn pri\">Додати локацію</button></div></form></div></section>",
+                 cs, NAME_PATTERN, self.code_field("lc"))
+        return self.layout(s, T("Локації"), hero, f"<section>{lst}</section>{form}", "locations",
+                           "s-bad" if down else ("s-ok" if locs else "s-idle"))
+
+    @staticmethod
+    def loc_grace(s, name):
+        return time.time() - s["made"].get(f"loc:{name}", 0) < CONF_GRACE
+
+    def page_location(self, s, name, method, f):
+        if method == "POST":
+            a = f.get("act", "")
+            if a == "save":
+                args = ["location", "set", name, opt("title", f.get("title", "")), opt("note", f.get("note", "")),
+                        "--panel", "on" if f.get("panel") else "off"]
+                cur = next((l for l in wgj("location", "list") if l["name"] == name), None)
+                nets = ",".join(x.strip() for x in f.get("networks", "").split(",") if x.strip())
+                if cur and cur["managed"] and nets != ",".join(cur["networks"]):
+                    if not self.need_code(s, f):          # new networks = the hub reaches new addresses
+                        self.flash(s, "bad", T("Щоб змінити мережі, потрібен код із застосунку"))
+                        raise Redirect(f"/l/{name}")
+                    args.append(opt("networks", nets))
+                self.act(s, args, T("Збережено"))
+            elif a == "sites":
+                self.act(s, ["location", "set", name, opt("sites", self.sites_value(f))], T("Права на сайти збережено"))
+            elif a in ("reissue", "rm"):
+                if not self.need_code(s, f):
+                    self.flash(s, "bad", T("Потрібен правильний код із застосунку"))
+                elif a == "rm":
+                    if self.act(s, ["location", "rm", name, "-y"], T("Локацію видалено")):
+                        raise Redirect("/locations")
+                elif self.act(s, ["location", "reissue", name], T("Нові ключі створено. Налаштуйте роутер за новим конфігом.")):
+                    s["made"][f"loc:{name}"] = time.time()
+            raise Redirect(f"/l/{name}")
+        prefetch(("location", "list"), ("site", "list"), ("status",), ("history", f"loc:{name}", "--range", self.rng()))
+        l = next((x for x in wgj("location", "list") if x["name"] == name), None)
+        if not l:
+            return self.layout(s, name, self.hero(T("Локацію не знайдено"), small=True), "", "locations")
+        cls, text, when = self.loc_lead(l)
+        hosted = [x for x in (wgj("status").get("topology") or {}).get("locations", {}).get(name, [])]
+        facts = [(l["ip"], T("адреса роутера у VPN")), (ago(l["handshake"]) if l.get("handshake") else "-", T("зв'язок")),
+                 ((l.get("endpoint") or "").rsplit(":", 1)[0] or "-", T("звідки підключається")),
+                 (str(len(hosted)), T("сайтів у мережі"))]
+        cap = text[:1].upper() + text[1:]
+        hero = self.hero(l["title"], e(f"{cap}: {when}." + (f" {l['note']}." if l.get("note") else "")), "", facts, chip=cap)
+        cs = self.csrf(s)
+        parts = []
+        if not l["managed"]:
+            parts.append(T("<section><div class=\"note warn\">Цю локацію налаштовано вручну у wg0.conf. Щоб керувати нею з панелі (мережі, ключі), виконайте через SSH: <span class=\"mono\">sudo wgctl location adopt {0}</span></div></section>", name))
+        else:
+            if l["has_conf"]:
+                grace = self.loc_grace(s, name)
+                hint = (T("Локацію щойно створено: конфіг доступний без коду ще кілька хвилин.") if grace else
+                        T("Конфіг містить приватний ключ роутера, тому потрібен код із застосунку."))
+                confh = (f'<p class="muted small">{hint}</p><form method="post" action="/l/{name}/conf" class="row">{cs}'
+                         + ("" if grace else self.code_field("lcc"))
+                         + T("<button class=\"btn pri\" name=\"fmt\" value=\"mikrotik\">MikroTik</button><button class=\"btn\" name=\"fmt\" value=\"openwrt\">OpenWrt</button><button class=\"btn\" name=\"fmt\" value=\"wg\">Файл WireGuard</button></form>"))
+            else:
+                confh = T("<p class=\"muted\">Конфіг роутера не збережено. «Нові ключі для роутера» нижче створять новий.</p>")
+            parts.append(T("<section><h2>Конфіг роутера</h2><div class=\"panel\">{0}<p class=\"hint\">Після підключення налаштуйте брандмауер роутера: з тунелю пускати лише {1} і лише на потрібні порти. Докладно — в документації, розділ «Локації».</p></div></section>", confh, HUB_IP))
+        if hosted:
+            rows = "".join(f'<div class="ln"><span class="when">{dot("ok" if x.get("ok") else "bad" if x.get("ok") is False else "idle")} '
+                           f'<a href="/s/{x["name"]}">{e(x["name"])}</a></span><span class="muted">{e(x["name"])}.{DOMAIN}</span></div>'
+                           for x in hosted)
+            parts.append(T("<section><h2>Сайти в мережі локації</h2><div class=\"lines\">{0}</div></section>", rows))
+        h = self.hist(f"loc:{name}")
+        parts.append(T("<section id=\"act\"><h2>Зв'язок</h2>{0}<div class=\"panel\">", self.range_tabs(f"/l/{name}", "act"))
+                     + self.strip(h, f"loc:{name}", "status", T("частка часу, коли роутер був на зв'язку")) + "</div></section>")
+        if l["managed"]:
+            parts.append(T("<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"lt\">Назва в панелі</label><input type=\"text\" id=\"lt\" name=\"title\" maxlength=\"80\" value=\"{1}\"></div>\n<div><label class=\"f\" for=\"lno\">Примітка</label><input type=\"text\" id=\"lno\" name=\"note\" maxlength=\"80\" value=\"{2}\"></div></div>\n<label class=\"f\" for=\"lnet\">Мережі за роутером (через кому)</label><input type=\"text\" id=\"lnet\" name=\"networks\" value=\"{3}\">\n<label class=\"check\"><input type=\"checkbox\" name=\"panel\" value=\"1\"{4}>Пускати мережу локації в цю панель</label>\n<p class=\"hint\">Зміна мереж потребує коду із застосунку.</p>\n<div class=\"row\">{5}<button class=\"btn pri\">Зберегти</button></div></form></div></section>",
+                           cs, e(l["title"]), e(l.get("note") or ""), e(", ".join(l["networks"])), " checked" if l["panel"] else "",
+                           self.code_field("lsc")))
+        sites = wgj("site", "list")
+        parts.append(T("<section><h2>Сайти для мережі локації</h2><div class=\"panel\"><p class=\"muted small\">Які сайти можуть відкривати пристрої в мережі локації без власного ключа. Потрібен NAT на роутері, див. документацію, розділ «Локації».</p><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"sites\">\n{1}<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>",
+                       cs, self.toggles(sites, l.get("sites") or [])))
+        if l["managed"]:
+            parts.append(T("<section><h2>Небезпечні дії</h2><div class=\"panel\"><p class=\"muted small\">Потрібен код із застосунку.</p>\n<form method=\"post\" class=\"row\">{0}{1}\n<button class=\"btn\" name=\"act\" value=\"reissue\" data-confirm=\"Створити нові ключі? Роутер утратить зв'язок, доки ви не налаштуєте на ньому новий конфіг.\">Нові ключі для роутера</button>\n<button class=\"btn danger\" name=\"act\" value=\"rm\" data-confirm=\"Видалити локацію {2}? Хаб утратить зв'язок з її мережами.\">Видалити локацію</button></form></div></section>",
+                           cs, self.code_field("ldc"), e(l["title"])))
+        state = {"ok": "s-ok", "warn": "s-warn", "bad": "s-bad"}.get(cls, "s-idle")
+        return self.layout(s, l["title"], hero, "".join(parts), "locations", state)
+
+    def location_conf(self, s, name, f):
+        """Router config holds the router's private key: POST only, TOTP code (or just created), logged."""
+        fmt = f.get("fmt", "")
+        if fmt not in ("wg", "mikrotik", "openwrt"):
+            raise Redirect(f"/l/{name}")
+        if not self.loc_grace(s, name) and not self.need_code(s, f):
+            self.flash(s, "bad", T("Щоб отримати конфіг, потрібен правильний код із застосунку"))
+            raise Redirect(f"/l/{name}")
+        rc, out, err = wg("location", "conf", name, "--format", fmt)
+        if rc != 0:
+            self.flash(s, "bad", err)
+            raise Redirect(f"/l/{name}")
+        event(T("Показано конфіг роутера локації {0} ({1})", name, s['ip']), "warning", "📍")
+        if fmt == "wg":
+            return self.send(200, out, "application/octet-stream",
+                             {"Content-Disposition": f'attachment; filename="location-{name}.conf"'})
+        what = "MikroTik (RouterOS 7)" if fmt == "mikrotik" else "OpenWrt"
+        hero = self.hero(T("Конфіг роутера: {0}", what),
+                         T("Вставте ці команди в термінал роутера. Вони містять приватний ключ: не пересилайте їх і закрийте сторінку після налаштування."),
+                         T("<a class=\"b fill\" href=\"/l/{0}\">Готово</a>", name), small=True)
+        body = f'<section><div class="panel"><pre class="code">{e(out)}</pre></div></section>'
+        return self.send(200, self.layout(s, T("Конфіг роутера"), hero, body, "locations"))
+
+    # -- issuing
+    def page_new(self, s, method, f):
+        err = ""
+        if method == "POST":
+            name = norm_name(f.get("name", ""))
+            args = ["add", name, opt("note", f.get("note", "")), "--sites", self.sites_value(f)]
+            if f.get("phone"):
+                args.append(opt("phone", f["phone"]))
+            ok = True
+            guest = f.get("kind") == "guest"
+            if guest:
+                try:
+                    hours = int(f.get("hours", ""))
+                except ValueError:
+                    hours = 0
+                if hours not in GUEST_HOURS:
+                    ok, err = False, T("Оберіть, на скільки годин видати гостьовий ключ")
+                args += ["--hours", str(hours)]
+            else:
+                if f.get("expires"):
+                    args.append(opt("expires", f["expires"]))
+                if not f.get("autorevoke"):
+                    args.append("--no-autorevoke")
+            if f.get("admin") and not guest:
+                if self.need_code(s, f):
+                    args.append("--admin")
+                else:
+                    ok, err = False, T("Щоб дати доступ до панелі, потрібен правильний код із застосунку")
+            if ok and not NAME_RE.match(name):
+                ok, err = False, T("Ім'я: ") + NAME_HINT[0].lower() + NAME_HINT[1:]
+            if ok:
+                rc, out, werr = wg(*args)
+                if rc == 0:
+                    s["made"][name] = time.time()
+                    self.flash(s, "ok", T("Ключ для {0} видано. Завантажте файл або покажіть QR.", name))
+                    raise Redirect(f"/c/{name}")
+                err = werr
+        prefetch(("site", "list"), ("status",))
+        sites = wgj("site", "list")
+        g = lambda k: e(str(f.get(k, "")))
+        hero = self.hero(T("Новий ключ"), T("Ключ видається одному пристрою. Після створення відкриється сторінка ключа: звідти завантажте файл або покажіть QR."), small=True)
+        body = T("{0}<form method=\"post\">{1}\n<section><h2>Тип доступу</h2><div class=\"kinds\">\n<label class=\"kind\"><input type=\"radio\" name=\"kind\" value=\"perm\" id=\"k-perm\"{2}><span><b>Постійний ключ</b>\n<small>Для своїх пристроїв. Відкликається сам, якщо пристрій не підключався 60 днів.</small></span></label>\n<label class=\"kind\"><input type=\"radio\" name=\"kind\" value=\"guest\" id=\"k-guest\"{3}><span><b>Гостьовий на кілька годин</b>\n<small>Для гостя чи разового доступу. Після кінця строку ключ відкличеться сам.</small></span></label></div>\n<div class=\"hours togs\">{4}</div>\n</section>\n<section><h2>Пристрій</h2><div class=\"panel\"><div class=\"g2\">\n<div><label class=\"f\" for=\"nm\">Ім'я пристрою, напр. iphone-olena</label><input type=\"text\" id=\"nm\" name=\"name\" required data-name maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{5}\" title=\"{6}\" value=\"{7}\"><p class=\"hint\">{8}</p></div>\n<div><label class=\"f\" for=\"n\">Примітка</label><input type=\"text\" id=\"n\" name=\"note\" maxlength=\"80\" value=\"{9}\"></div>\n<div><label class=\"f\" for=\"ph\">Телефон для сповіщень (необов'язково)</label><input type=\"tel\" id=\"ph\" name=\"phone\" placeholder=\"+380671234567\" value=\"{10}\"></div>\n<div class=\"perm\"><label class=\"f\" for=\"ex\">Термін дії (необов'язково)</label><input type=\"date\" id=\"ex\" name=\"expires\" value=\"{11}\"></div></div>\n<label class=\"check perm\"><input type=\"checkbox\" name=\"autorevoke\" value=\"1\" checked>Автовідкликання після 60 дн без підключень</label></div></section>\n<section><h2>Сайти</h2><div class=\"panel\">{12}</div></section>\n<section class=\"perm\"><h2>Панель</h2><div class=\"panel\"><label class=\"check\"><input type=\"checkbox\" name=\"admin\" value=\"1\">Дати доступ до цієї панелі</label>\n<div class=\"row\">{13}</div></div></section>\n<div class=\"row\"><button class=\"btn pri\">Видати ключ</button><a class=\"btn\" href=\"/\">Скасувати</a></div></form>", f'<div class="note bad">{e(err)}</div>' if err else '', self.csrf(s), '' if f.get('kind') == 'guest' else ' checked', ' checked' if f.get('kind') == 'guest' else '', ''.join(T("<label class=\"tog\"><input type=\"radio\" name=\"hours\" value=\"{0}\"{1}><span>{2} год</span></label>", h, " checked" if str(h) == str(f.get("hours", "4")) else "", h) for h in GUEST_HOURS), NAME_PATTERN, NAME_HINT, g('name'), NAME_HINT, g('note'), g('phone'), g('expires'), self.toggles(sites, []), self.code_field('cd', label=T("Код із застосунку (лише для доступу до панелі)")))
+        return self.layout(s, T("Новий ключ"), hero, body, "home", self.sys_state()[0])
+
+    # -- sites
+    def page_sites(self, s, method, f):
+        if method == "POST":
+            sname, backend = norm_name(f.get("name", "")), str(f.get("backend", "")).strip()
+            if not NAME_RE.match(sname) or backend.startswith("-") or not backend:
+                self.flash(s, "bad", T("Ім'я сайту: малі латинські літери, цифри і дефіс; адреса у форматі http://IP:порт"))
+                raise Redirect("/sites")
+            args = ["site", "add", sname, backend]
+            if f.get("insecure"):
+                args.append("--insecure")
+            if f.get("upstream_host"):
+                args.append("--upstream-host")
+            if f.get("note"):
+                args.append(opt("note", f["note"]))
+            if self.act(s, args, T("Сайт додано. Тепер дайте до нього доступ ключам.")):
+                raise Redirect(f"/s/{args[2]}")
+            raise Redirect("/sites")
+        prefetch(("site", "list"), ("status",))
+        sites = wgj("site", "list")
+        tcp = self.tcp_list()
+        okn = sum(1 for x in sites if (x.get("health") or {}).get("ok"))
+        pub = sum(1 for x in sites if x.get("public"))
+        lead = (T("{0} з {1} відповідають", okn, len(sites)) + (T(", публічних {0}", pub) if pub else "") +
+                T(". Сайт може бути в мережі будь-якої локації, на пристрої з ключем або на самому VPS.")) if sites else T("Сайтів ще немає.")
+        hero = self.hero(T("Сайти й сервіси"), lead, T("<a class=\"b fill\" href=\"#add\">Додати сайт</a><a class=\"b\" href=\"#add-tcp\">Додати сервіс</a>"), small=True)
+        cards = "".join(self.site_card(x) for x in sites)
+        body = T("<section><div class=\"keys sites-grid\">{0}</div></section>\n{1}\n<section id=\"add\"><h2>Додати сайт</h2><div class=\"panel\"><form method=\"post\">{2}\n<div class=\"g2\"><div><label class=\"f\" for=\"sn\">Ім'я (стане ім'я.{3})</label><input type=\"text\" id=\"sn\" name=\"name\" required data-name maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{4}\" title=\"{5}\"><p class=\"hint\">{6}</p></div>\n<div><label class=\"f\" for=\"sb\">Адреса сервісу</label><input type=\"text\" id=\"sb\" name=\"backend\" required placeholder=\"http://192.168.1.20:80\"></div></div>\n<label class=\"f\" for=\"snt\">Примітка</label><input type=\"text\" id=\"snt\" name=\"note\" maxlength=\"80\">\n<label class=\"check\"><input type=\"checkbox\" name=\"insecure\" value=\"1\">Сервіс на HTTPS із самопідписаним сертифікатом</label>\n<label class=\"check\"><input type=\"checkbox\" name=\"upstream_host\" value=\"1\">Передавати сервісу його власну адресу (якщо видає «Invalid host»)</label>\n<p class=\"small muted\">У мережі локації: адреса з її мережі, роутер має пропускати з'єднання від хаба. На пристрої з ключем: http://{7}X:порт, пристрій має бути онлайн і пускати з {8}.</p>\n<div class=\"row\"><button class=\"btn pri\">Додати сайт</button></div></form></div></section>", cards or T("<p class=\"muted\">Додайте перший сайт.</p>"), self.tcp_section(s, tcp), self.csrf(s), DOMAIN, NAME_PATTERN, NAME_HINT, NAME_HINT, NET, HUB_IP)
+        return self.layout(s, T("Сайти й сервіси"), hero, body, "sites", self.sys_state()[0])
+
+    @staticmethod
+    def site_visits(name):
+        try:
+            return wgj("visits", "--site", name)["rows"]
+        except (RuntimeError, ValueError, KeyError):
+            return []
+
+    # -- TCP services
+    def tcp_list(self):
+        try:
+            return wgj("tcp", "list")
+        except (RuntimeError, ValueError):
+            return {"ready": False, "services": []}
+
+    def svc_card(self, sv):
+        h = sv.get("health") or {}
+        cls = "ok" if h.get("ok") else ("bad" if h else "idle")
+        hs = T("{0} мс", h.get('ms')) if h.get("ok") else (T("ціль не відповідає") if h else T("ще не перевірено"))
+        ico = (f'<svg class="pl-ico" viewBox="0 0 44 44" aria-hidden="true"><rect class="pl {cls}" x="6" y="6" width="32" height="32" rx="9"/>'
+               f'<rect class="dt {cls}" x="17" y="17" width="10" height="10" rx="3"/></svg>')
+        return (T("<a class=\"k site {0}\" href=\"/t/{1}\"><div class=\"top\">{2}<div class=\"lf\"><span>{3}</span><span>порт {4} → {5}:{6}</span></div></div><div class=\"nm\">{7}</div><div class=\"pills\"><span class=\"pill {8}\">{9}</span><span class=\"pill\">{10} з доступом</span></div></a>", cls, sv["name"], ico, e(SVC_KINDS.get(sv["kind"], SVC_KINDS["tcp"])[0]), sv["port"], e(sv["target"]), sv["target_port"], e(sv["name"]), cls if cls != "idle" else "", e(hs), len(sv["allow"])))
+
+    def tcp_section(self, s, tcp):
+        cards = "".join(self.svc_card(x) for x in tcp["services"])
+        ready = "" if tcp["ready"] else (
+            T("<div class=\"note warn\">Щоб сервіси запрацювали, один раз виконайте на VPS через SSH: <span class=\"mono\">sudo wgctl tcp setup</span>. Команда покаже зміни в брандмауері й попросить підтвердження.</div>"))
+        opts = "".join(f'<option value="{k}">{e(v[0])}{T(" (порт {0})", v[1]) if v[1] else ""}</option>' for k, v in SVC_KINDS.items())
+        return T("<section id=\"tcp\"><h2>TCP-сервіси <small>SSH, віддалений робочий стіл та інше</small></h2>{0}\n<div class=\"keys sites-grid\">{1}</div></section>\n<section id=\"add-tcp\"><h2>Додати сервіс</h2><div class=\"panel\"><form method=\"post\" action=\"/t/new\">{2}\n<div class=\"g2\"><div><label class=\"f\" for=\"tn\">Ім'я (підключення: ім'я.{3}:порт)</label><input type=\"text\" id=\"tn\" name=\"name\" required data-name maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{4}\" title=\"{5}\" placeholder=\"notebook-ssh\"></div>\n<div><label class=\"f\" for=\"tk\">Тип</label><select id=\"tk\" name=\"kind\">{6}</select></div>\n<div><label class=\"f\" for=\"ti\">Адреса цілі</label><input type=\"text\" id=\"ti\" name=\"target\" required placeholder=\"192.168.1.20\" inputmode=\"decimal\"></div>\n<div><label class=\"f\" for=\"tp\">Порт цілі (для іншого TCP)</label><input type=\"text\" id=\"tp\" name=\"tport\" inputmode=\"numeric\" placeholder=\"типово за типом\"></div></div>\n<label class=\"f\" for=\"tnt\">Примітка</label><input type=\"text\" id=\"tnt\" name=\"note\" maxlength=\"80\">\n<p class=\"hint\">Ціль: пристрій у мережі локації (напр. 192.168.1.X) або пристрій із ключем ({7}X). Сервіс отримає власний порт на хабі.\nРоутер локації має пропускати цей порт від хаба, на пристрої з ключем брандмауер має пускати {8}.</p>\n<div class=\"row\"><button class=\"btn pri\">Додати сервіс</button></div></form></div></section>", ready, cards or T("<p class=\"muted\">Сервісів ще немає.</p>"), self.csrf(s), DOMAIN, NAME_PATTERN, NAME_HINT, opts, NET, HUB_IP)
+
+    def page_svc(self, s, name, method, f):
+        if name == "new" and method == "POST":
+            sname, ip = norm_name(f.get("name", "")), str(f.get("target", "")).strip()
+            kind = f.get("kind") if f.get("kind") in SVC_KINDS else "tcp"
+            port = str(f.get("tport", "")).strip() or str(SVC_KINDS[kind][1] or "")
+            if not NAME_RE.match(sname) or not re.fullmatch(r"[\d.]{7,15}", ip) or not port.isdigit():
+                self.flash(s, "bad", T("Перевірте ім'я, адресу цілі (напр. 192.168.1.20) і порт"))
+                raise Redirect("/sites#add-tcp")
+            args = ["tcp", "add", sname, f"{ip}:{port}"] + ([opt("note", f["note"])] if f.get("note") else [])
+            if self.act(s, args, T("Сервіс додано. Тепер дайте до нього доступ ключам.")):
+                raise Redirect(f"/t/{sname}")
+            raise Redirect("/sites#add-tcp")
+        tcp = self.tcp_list()
+        sv = next((x for x in tcp["services"] if x["name"] == name), None)
+        if not sv:
+            return self.layout(s, name, self.hero(T("Сервіс не знайдено"), small=True), "", "sites")
+        if method == "POST":
+            a = f.get("act")
+            if a == "access":
+                want = f.get("who", [])
+                want = {want} if isinstance(want, str) else set(want)
+                cand = [w for w in f.get("cand", "").split(",") if NAME_RE.match(w)]
+                add = sorted(w for w in cand if w in want and w not in sv["allow"])
+                rem = sorted(w for w in cand if w not in want and w in sv["allow"])
+                if add:
+                    self.act(s, ["tcp", "allow", name] + add, T("Доступ надано: {0}", ', '.join(add)))
+                if rem:
+                    self.act(s, ["tcp", "deny", name] + rem, T("Доступ забрано: {0}", ', '.join(rem)))
+            elif a == "save":
+                tgt = f"{str(f.get('target', '')).strip()}:{str(f.get('tport', '')).strip()}"
+                self.act(s, ["tcp", "set", name, opt("target", tgt), opt("note", f.get("note", ""))], T("Сервіс збережено"))
+            elif a == "delete":
+                if self.act(s, ["tcp", "rm", name], T("Сервіс видалено")):
+                    raise Redirect("/sites")
+            raise Redirect(f"/t/{name}")
+        clients = wgj("list")
+        h = sv.get("health") or {}
+        state = "s-ok" if h.get("ok") else ("s-bad" if h else "s-idle")
+        lead = (T("{0} на {1}:{2}, розміщено: {3}. Доступ мають {4} ключів.", e(SVC_KINDS.get(sv['kind'], SVC_KINDS['tcp'])[0]), e(sv['target']), sv['target_port'], e(self.where(sv)), len(sv['allow'])))
+        facts = [(f"{sv['port']}", T("порт на хабі")), (f"{sv['target']}:{sv['target_port']}", T("ціль")),
+                 (len(sv["allow"]), T("мають доступ")), (T("{0} мс", h['ms']) if h.get("ok") else "-", T("відповідь цілі"))]
+        hero = self.hero(f"{sv['host']}:{sv['port']}", lead, "", facts,
+                         chip=T("Відповідає") if h.get("ok") else (T("Ціль не відповідає") if h else T("Ще не перевірено")))
+        cs = self.csrf(s)
+        togs, cands = [], []
+        for c in clients:
+            if c["status"] == "revoked":
+                continue
+            cands.append(c["name"])
+            off = T(" (вимкнений)") if c["status"] != "active" else ""
+            togs.append(f'<label class="tog"><input type="checkbox" name="who" value="{c["name"]}"'
+                        f'{" checked" if c["name"] in sv["allow"] else ""}><span>{e(c["name"])}{off}</span></label>')
+        ready = "" if tcp["ready"] else (T("<div class=\"note warn\">Сервіс ще не працює: виконайте один раз на VPS <span class=\"mono\">sudo wgctl tcp setup</span>.</div>"))
+        body = T("{0}<section><h2>Як підключитися</h2><div class=\"panel\"><p class=\"mono\">{1}</p>\n<p class=\"hint\">Працює лише з пристроїв, яким нижче дано доступ, і лише через VPN. Ціль бачить підключення від {2}.</p></div></section>\n<section><h2>Доступ</h2><div class=\"panel\"><form method=\"post\">{3}<input type=\"hidden\" name=\"act\" value=\"access\">\n<input type=\"hidden\" name=\"cand\" value=\"{4}\"><div class=\"togs\">{5}</div>\n<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>\n{6}\n<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{7}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"ti\">Адреса цілі</label><input type=\"text\" id=\"ti\" name=\"target\" value=\"{8}\" required></div>\n<div><label class=\"f\" for=\"tp\">Порт цілі</label><input type=\"text\" id=\"tp\" name=\"tport\" value=\"{9}\" inputmode=\"numeric\" required></div></div>\n<label class=\"f\" for=\"tnt\">Примітка</label><input type=\"text\" id=\"tnt\" name=\"note\" maxlength=\"80\" value=\"{10}\">\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form>\n<div class=\"row\">{11}</div></div></section>", ready, e(svc_howto(sv)), HUB_IP, cs, ','.join(cands), ''.join(togs) or T("<p class=\"muted\">Ключів ще немає.</p>"), self.availability(f"/t/{name}", name), cs, e(sv['target']), sv['target_port'], e(sv.get('note') or ''), self.bform(s, "delete", T("Видалити сервіс"), "btn danger", T("Видалити {0}? Доступ до нього зникне в усіх.", sv['name'])))
+        return self.layout(s, sv["name"], hero, body, "sites", state)
+
+    def page_site(self, s, name, method, f):
+        if method == "GET":
+            prefetch(("site", "list"), ("list",), ("status",), ("history", f"up:{name},ms:{name}", "--range", self.rng()),
+                     ("visits", "--site", name))
+        sites = wgj("site", "list")
+        site = next((x for x in sites if x["name"] == name), None)
+        if not site:
+            return self.layout(s, name, self.hero(T("Сайт не знайдено"), small=True), "", "sites")
+        if method == "POST":
+            a = f.get("act")
+            if a == "save":
+                self.act(s, ["site", "set", name, opt("backend", f.get("backend", "")),
+                             "--insecure", "on" if f.get("insecure") else "off",
+                             "--upstream-host", "on" if f.get("upstream_host") else "off",
+                             *([opt("log", f["log"])] if f.get("log") in ("full", "hide-path", "off") else []),
+                             *([opt("log-skip", f.get("log_skip", "").strip() or "none")] if "log_skip" in f else []),
+                             opt("note", f.get("note", ""))], T("Сайт збережено"))
+            elif a == "access":
+                want = f.get("who", [])
+                want = {want} if isinstance(want, str) else set(want)
+                for who in f.get("cand", "").split(","):
+                    if not NAME_RE.match(who):
+                        continue
+                    has = who in site["access"]
+                    if who in want and not has:
+                        self.act(s, ["grant", who, name], T("Доступ надано: {0}", who))
+                    elif who not in want and has:
+                        self.act(s, ["deny", who, name], T("Доступ забрано: {0}", who))
+            elif a == "delete":
+                if self.act(s, ["site", "rm", name], T("Сайт видалено")):
+                    raise Redirect("/sites")
+            elif a in ("public_on", "public_off"):
+                if not self.need_code(s, f):
+                    self.flash(s, "bad", T("Потрібен правильний код із застосунку"))
+                else:
+                    self.act(s, ["site", "set", name, "--public", "on" if a == "public_on" else "off"], "")
+            raise Redirect(f"/s/{name}")
+        prefetch(("list",), ("status",))
+        clients = wgj("list")
+        status = wgj("status")
+        cs = self.csrf(s)
+        h = site.get("health") or {}
+        state = "s-ok" if h.get("ok") else ("s-bad" if h else "s-idle")
+        lead = (T("Відповідає за {0} мс", h.get('ms')) if h.get("ok") else T("Не відповідає") if h else T("Ще не перевірено")) + \
+            T(". Розміщено: {0}. ", e(self.where(site))) + \
+            (T("Публічний: відкривається з інтернету через Cloudflare.") if site.get("public") else
+             T("Доступ лише через VPN: {0} з правом.", len(site['access'])))
+        acts = T("<a class=\"b fill\" href=\"https://{0}\" rel=\"noopener\">Відкрити сайт</a>", e(site["host"]))
+        facts = [(self.where(site), T("де розміщено")), (site["backend"].split("://", 1)[-1], T("адреса сервісу")),
+                 (T("усі") if site.get("public") else len(site["access"]), T("мають доступ")),
+                 (T("так") if site.get("public") else T("ні"), T("публічний"))]
+        hero = self.hero(site["host"], lead, acts, facts,
+                         chip=T("Відповідає") if h.get("ok") else (T("Не відповідає") if h else T("Ще не перевірено")))
+        togs, cands = [], []
+        for kind, x in [("client", c) for c in clients if c["status"] != "revoked"] + \
+                       [("location", l) for l in status["locations"]]:
+            pname = x["name"]
+            allsites = x.get("sites") == "*"
+            label = T("{0} (уся мережа)", x.get('title') or pname) if kind == "location" else pname
+            togs.append(f'<label class="tog"><input type="checkbox" name="who" value="{pname}"'
+                        f'{" checked" if pname in site["access"] else ""}{" disabled" if allsites else ""}>'
+                        f'<span>{e(label)}{T(" · усі сайти") if allsites else ""}</span></label>')
+            if not allsites:
+                cands.append(pname)
+        if site.get("public"):
+            pub = (T("<div class=\"note warn\">Сайт бачить увесь інтернет через Cloudflare; права ключів на нього не діють. Захищає лише логін самого сайту.</div>"))
+            pact, plabel, pcls = "public_off", T("Зробити лише через VPN"), "btn"
+        else:
+            pub = (T("<p class=\"muted small\">Публічний сайт відкривається з інтернету через Cloudflare. Потрібні власний логін і регулярні оновлення сервісу.</p>"))
+            pact, plabel, pcls = "public_on", T("Зробити публічним"), "btn danger"
+        body = T("<section><h2>Доступ</h2><div class=\"panel\"><form method=\"post\">{0}<input type=\"hidden\" name=\"act\" value=\"access\">\n<input type=\"hidden\" name=\"cand\" value=\"{1}\"><div class=\"togs\">{2}</div>\n<p class=\"small muted\">Ключі з правом «усі сайти» змінюються на сторінці ключа.</p>\n<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>\n{3}\n<section><h2>Хто заходив <small>за 30 днів</small></h2>{4}</section>\n<section><h2>Публічний доступ</h2><div class=\"panel\">{5}<form method=\"post\" class=\"row\">{6}{7}\n<button class=\"{8}\" name=\"act\" value=\"{9}\">{10}</button></form></div></section>\n<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{11}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"sb\">Адреса сервісу</label><input type=\"text\" id=\"sb\" name=\"backend\" value=\"{12}\" required></div>\n<div><label class=\"f\" for=\"sn\">Примітка</label><input type=\"text\" id=\"sn\" name=\"note\" maxlength=\"80\" value=\"{13}\"></div></div>\n<label class=\"check\"><input type=\"checkbox\" name=\"insecure\" value=\"1\"{14}>Сервіс на HTTPS із самопідписаним сертифікатом</label>\n<label class=\"check\"><input type=\"checkbox\" name=\"upstream_host\" value=\"1\"{15}>Передавати сервісу його власну адресу</label>\n<label class=\"f\" for=\"slog\">Журнал звернень</label><select id=\"slog\" name=\"log\">{17}</select>\n<label class=\"f\" for=\"slsk\">Не записувати шляхи (через кому)</label><input type=\"text\" id=\"slsk\" name=\"log_skip\" maxlength=\"400\" placeholder=\"/s, /health\" value=\"{18}\">\n<p class=\"hint\">«Без шляху»: у журнал потрапляє лише перший сегмент адреси, напр. /hook/[hidden]. Секрети з адреси й параметрів запиту не записуються.</p>\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form>\n<div class=\"row\">{16}</div></div></section>", cs, ','.join(cands), ''.join(togs) or T("<p class=\"muted\">Ключів ще немає.</p>"), self.availability(f"/s/{name}", name), self.visits_block(self.site_visits(name)), pub, cs, self.code_field('pc'), pcls, pact, plabel, cs, e(site['backend']), e(site.get('note') or ''), ' checked' if site.get('insecure') else '', ' checked' if site.get('upstream_host') else '', self.bform(s, "delete", T("Видалити сайт"), "btn danger", T("Видалити {0}? Доступ до нього зникне в усіх.", site['host'])),
+                 "".join(f'<option value="{v}"{" selected" if site.get("log", "full") == v else ""}>{e(t)}</option>'
+                         for v, t in (("full", T("Повний")), ("hide-path", T("Без шляху (ховати секрети в адресі)")),
+                                      ("off", T("Не писати")))),
+                 e(", ".join(site.get("log_skip") or [])))
+        return self.layout(s, site["host"], hero, body, "sites", state)
+
+    # -- notifications
+    def groups(self):
+        try:
+            return wgj("notify", "groups")
+        except (RuntimeError, ValueError):
+            return []
+
+    def notify_block(self, s):
+        n = wgj("notify", "show")
+        cs = self.csrf(s)
+        groups = self.groups() if n["ready"] else []
+        gopts = T("<option value=\"\">не задано: загальні адмінам у приватні</option>") + "".join(
+            T("<option value=\"{0}\"{1}>{2}, учасників {3}</option>", e(g["id"]), " selected" if g["id"] == n.get("group") else "", e(g["name"] or T("без назви")), g["members"]) for g in groups if g.get("member"))
+        if n.get("group") and n["group"] not in [g["id"] for g in groups]:
+            gopts += f'<option value="{e(n["group"])}" selected>{e(n.get("group_name") or T("задана група"))}</option>'
+        state = (T("працює, відправник ") + e(n["sender"]) if n["ready"] else
+                 T("signal-cli встановлено, номер-відправник ще не зареєстровано") if n["signal_cli"] else T("signal-cli не встановлено"))
+        grp = (e(n.get("group_name") or T("задана")) + (T(" (склад оновлюється автоматично)") if n.get("group_managed")
+                                                     else T(" (склад змінюйте в Signal)"))) if n.get("group") else T("не задано")
+        q = n["queue"]
+        queue = (T("{0} у черзі", q) + (T(", надішлються, щойно запрацює номер") if q and not n["ready"] else "")) if q else T("порожня")
+        err = T("<dt>Остання помилка</dt><dd>{0}</dd>", e(n["last_error"])) if n.get("last_error") else ""
+        chk = lambda k: " checked" if n.get(k) else ""
+        extra = ""
+        if n["ready"] and n.get("admins"):
+            extra += (T("<form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"notify_group\"><div><label class=\"f\" for=\"gn\">Нова група з усіма адміністраторами</label><input type=\"text\" id=\"gn\" name=\"gname\" value=\"{1}\"></div>{2}<button class=\"btn\">Створити групу</button></form>", cs, e(BRAND), self.code_field("gc")))
+        if n["ready"] and (n.get("admins") or n.get("group")):
+            extra += f'<div class="row">{self.bform(s, "notify_test", T("Надіслати тестове"), "btn")}</div>'
+        return T("<section><h2>Сповіщення Signal</h2><div class=\"panel\"><dl class=\"kv\">\n<dt>Стан</dt><dd>{0}</dd><dt>Груповий чат</dt><dd>{1}</dd><dt>Черга</dt><dd>{2}</dd>\n<dt>Надіслано</dt><dd>{3}{4}</dd>{5}</dl>\n<form method=\"post\">{6}<input type=\"hidden\" name=\"act\" value=\"notify\">\n<div class=\"g2\"><div><label class=\"f\" for=\"na\">Адміністратори (через кому)</label>\n<input type=\"text\" id=\"na\" name=\"admins\" placeholder=\"+380671234567, +380501234567\" value=\"{7}\"></div>\n<div><label class=\"f\" for=\"ng\">Груповий чат</label><select id=\"ng\" name=\"group\">{8}</select></div></div>\n<label class=\"check\"><input type=\"checkbox\" name=\"connect\" value=\"1\"{9}>Надсилати підключення і відключення всіх пристроїв</label>\n<label class=\"check\"><input type=\"checkbox\" name=\"report\" value=\"1\"{10}>Щоденний звіт о 08:00</label>\n<label class=\"check\"><input type=\"checkbox\" name=\"users\" value=\"1\"{11}>Повідомляти користувачів на їхній номер</label>\n<p class=\"small muted\">У груповий чат: усі сповіщення — інформація, попередження, критичне, щоденний звіт. Адміністраторам приватно: критичне, що потребує негайної уваги (дублюється в групу), і зміни складу адміністраторів. Поки групу не задано, усе йде адміністраторам приватно. Користувачам: лише про їхній пристрій.</p>\n<div class=\"row\">{12}<button class=\"btn pri\">Зберегти</button></div></form>{13}</div></section>", state, grp, queue, n['sent_total'], (T(", останнє ") + fmt_ts(n['last_sent'])) if n['last_sent'] else '', err, cs, e(', '.join(n.get('admins') or [])), gopts, chk('connect'), chk('report'), chk('users'), self.code_field('nc', label=T("Код (якщо змінюєте адміністраторів чи групу)")), extra)
+
+    def keys_block(self, s):
+        try:
+            rd = wgj("config")["rotate_days"]
+        except (RuntimeError, KeyError):
+            rd = 180
+        opts = "".join(f'<option value="{d}"{" selected" if d == rd else ""}>{t}</option>' for d, t in ROTATE_CHOICES)
+        if rd not in {d for d, _ in ROTATE_CHOICES}:
+            opts += T("<option value=\"{0}\" selected>раз на {1} днів</option>", rd, rd)
+        names = {"uk": "Українська", "en": "English"}
+        lopts = "".join(f'<option value="{c}"{" selected" if c == LANG else ""}>{e(names.get(c, c))}</option>' for c in LANGUAGES)
+        lang = T("<section><h2>Мова</h2><div class=\"panel\"><form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"language\"><div><label class=\"f\" for=\"lng\">Мова панелі, CLI і сповіщень</label><select id=\"lng\" name=\"language\">{1}</select></div><button class=\"btn\">Зберегти</button></form><p class=\"hint\">Панель перезапуститься на кілька секунд, вхід збережеться.</p></div></section>", self.csrf(s), lopts)
+        return lang + (T("<section><h2>Ключі</h2><div class=\"panel\"><form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"rotate\"><div><label class=\"f\" for=\"rd\">Нагадувати змінити ключ</label><select id=\"rd\" name=\"rotate_days\">{1}</select></div><button class=\"btn\">Зберегти</button></form><p class=\"hint\">Коли ключ не змінювався довше, на картці з'являється «час змінити ключ», а вам приходить нагадування. Сам ключ не змінюється: новий конфіг треба імпортувати на пристрій.</p></div></section>", self.csrf(s), opts))
+
+    # -- log
+    def page_log(self, s, client, cat=""):
+        args = ["log", "-n", "300"]
+        if client and NAME_RE.match(client):
+            args += ["--client", client]
+        else:
+            client = ""
+        if cat in CAT:
+            args += ["--cat", cat]
+        else:
+            cat = ""
+        prefetch(tuple(args), ("status",))
+        items = wgj(*args)
+        q = (f"client={client}&" if client else "")
+        fl = T("<a class=\"{0}\" href=\"/log{1}\">Усі</a>", "on" if not cat else "", "?client=" + client if client else "") + "".join(
+            f'<a class="{"on" if cat == k else ""}" href="/log?{q}cat={k}">{v}</a>' for k, v in CAT.items())
+        hero = self.hero(T("Журнал") + (f": {client}" if client else ""),
+                         T("Останні {0} подій", len(items)) + (T(" ключа {0}", e(client)) if client else "") + ".", small=True)
+        body = (T("<div class=\"filters\">{0}</div><form method=\"get\" class=\"row\">{1}<div><input type=\"text\" name=\"client\" placeholder=\"ім'я ключа\" value=\"{2}\"></div><button class=\"btn\">Показати</button></form><br>{3}", fl, f"<input type=hidden name=cat value={cat}>" if cat else "", e(client), self.events(items, T("Подій за цим фільтром немає."))))
+        return self.layout(s, T("Журнал"), hero, body, "log", self.sys_state()[0])
+
+    # -- server
+    SVC_NAMES = {"wg-quick@wg0": "WireGuard", "caddy": T("Caddy (сайти)"), "vpnadmin": T("Ця панель"), "nftables": T("Брандмауер"),
+                 "ssh": "SSH"}
+    TIMER_NAMES = {"wgctl-monitor": T("Перевірка мережі"), "wgctl-geo": T("Оновлення геобаз"), "wgctl-report": T("Щоденний звіт"),
+                   "wgctl-backup": T("Резервна копія")}
+
+    def page_server(self, s, method, f):
+        if method == "POST":
+            if f.get("act") == "backup":
+                rc, out, err = wg("backup", "run", "--signal", timeout=300)
+                self.flash(s, "ok" if rc == 0 else "bad",
+                           T("Копію створено") + (T(" і поставлено в чергу Signal") if "Signal" in out else "") if rc == 0 else err)
+            raise Redirect("/server")
+        prefetch(("server",), ("status",))
+        v = wgj("server")
+        issues = v.get("issues", [])
+        cls = ("s-bad" if any(i["level"] == "bad" for i in issues) else
+               "s-warn" if any(i["level"] == "warn" for i in issues) else "s-ok")
+        days = v["uptime"] // 86400
+        lead = (T("{0}, ядро {1}. Працює без перезавантаження {2} дн.", e(v['os']), e(v['kernel']), days)
+                if days else T("{0}, ядро {1}. Перезавантажено сьогодні.", e(v['os']), e(v['kernel'])))
+        facts = [(f"{v['disk_pct']:.0f}%", T("диск, вільно {0}", human(v['disk_total'] - v['disk_used']))),
+                 (f"{v['mem_pct']:.0f}%", T("пам'ять з {0}", human(v['mem_total']))),
+                 (f"{v['load'][0]:.2f}", T("навантаження, ядер {0}", v['cpus'])),
+                 (T("{0} дн", v['cert_days']) if v.get("cert_days") is not None else "-", T("сертифікат дійсний"))]
+        hero = self.hero(T("Сервер ") + v["host"], lead, "", facts, chip={"s-ok": T("Усе в нормі"), "s-warn": T("Потрібна увага"),
+                                                                     "s-bad": T("Є збій")}[cls])
+        parts = []
+        if issues:
+            parts.append('<section>' + "".join(f'<div class="note {"bad" if i["level"] == "bad" else "warn" if i["level"] == "warn" else ""}">{e(i["text"])}</div>'
+                                               for i in issues) + "</section>")
+        # services and timers
+        rows = "".join(f'<div class="ln"><span class="when"><span class="sd {"ok" if st_ == "active" else "bad"}"></span>'
+                       f'{e(self.SVC_NAMES.get(n, n))}</span><span class="muted">{e(n)}</span>'
+                       f'<span class="muted small">{T("працює") if st_ == "active" else e(st_)}</span></div>'
+                       for n, st_ in v.get("services", {}).items())
+        rows += "".join(T("<div class=\"ln\"><span class=\"when\"><span class=\"sd {0}\"></span>{1}</span><span class=\"muted\">востаннє {2}{3}</span><span class=\"muted small\">{4}</span></div>", "ok" if t["active"] == "active" else "bad", e(self.TIMER_NAMES.get(n, n)), ago(t["last"]) if t["last"] else T("ще не запускався"), T(", далі ") + fmt_ts(t["next"])[11:] if t["next"] else "", T("увімкнено") if t["active"] == "active" else T("вимкнено"))
+                        for n, t in v.get("timers", {}).items())
+        parts.append(T("<section><h2>Служби</h2><div class=\"lines\">{0}</div></section>", rows))
+        locs = wgj("status")["locations"]
+        h = self.hist("load", "mem", "disk", *[f"loc:{l['name']}" for l in locs])
+        parts.append(T("<section id=\"load\"><h2>Навантаження</h2>{0}<div class=\"panel\">", self.range_tabs("/server", "load"))
+                     + "".join(self.strip(h, f"loc:{l['name']}", "status", T("зв'язок: {0}", l['title'])) for l in locs)
+                     + T("<h2 class=\"sub\">Навантаження процесора</h2>") + self.chart(h, [("load", T("навантаження"), "c1")], "line", lambda v: f"{v:.2f}")
+                     + T("<h2 class=\"sub\">Пам'ять, %</h2>") + self.chart(h, [("mem", T("пам'ять"), "c1")], "line", lambda v: f"{v:.0f}", "%")
+                     + T("<h2 class=\"sub\">Диск, %</h2>") + self.chart(h, [("disk", T("диск"), "c1")], "line", lambda v: f"{v:.0f}", "%")
+                     + "</div></section>")
+        # updates
+        upd = v.get("updates")
+        upd_t = (T("не вдалося перевірити") if upd is None else
+                 T("доступно {0}, з них безпеки {1}", upd, v['security']) if upd else T("система оновлена"))
+        reboot = (T("потрібне з {0}", fmt_ts(v['reboot_since'])[:10]) + (f" ({e(', '.join(v['reboot_pkgs'][:5]))})" if v["reboot_pkgs"] else "")
+                  if v["reboot"] else T("не потрібне"))
+        parts.append(T("<section><h2>Оновлення</h2><div class=\"panel\"><dl class=\"kv\">\n<dt>Пакети</dt><dd>{0}</dd><dt>Автоматичні оновлення безпеки</dt><dd>{1}</dd>\n<dt>Перезавантаження</dt><dd>{2}</dd></dl>\n<p class=\"hint\">Оновити вручну через SSH: sudo apt update && sudo apt upgrade. Перезавантаження: sudo reboot, після нього тунель і сайти піднімуться самі.</p></div></section>", upd_t, T("увімкнено") if v["unattended"] else T("вимкнено"), reboot))
+        # backups
+        b = v.get("backup") or {}
+        if not b.get("configured"):
+            bk = (T("<p>Резервні копії ще не налаштовано. Через SSH: <span class=\"mono\">sudo apt install age</span>, потім <span class=\"mono\">sudo wgctl backup init</span>. Команда покаже ключ розшифрування: збережіть його в менеджері паролів.</p>"))
+        else:
+            files = "".join(f'<div class="ln"><span class="when">{fmt_ts(x["ts"])}</span><span class="mono muted">{e(x["name"])}</span>'
+                            f'<span class="muted small">{human(x["size"])}</span></div>' for x in b["files"][:7])
+            bk = (T("<dl class=\"kv\"><dt>Остання копія</dt><dd>{0}{1}</dd><dt>Надіслано в Signal</dt><dd>{2}</dd><dt>Зберігається на VPS</dt><dd>{3} з 14</dd>", fmt_ts(b["last_ok"]) if b["last_ok"] else T("ще не було"), (" (" + human(b["last_size"]) + ")") if b.get("last_size") else "", fmt_ts(b["last_signal"]) if b["last_signal"] else T("ще ні (потрібен зареєстрований номер Signal)"), len(b["files"]))
+                  + (T("<dt>Помилка</dt><dd>{0}</dd>", e(b["last_error"])) if b.get("last_error") else "") + T("</dl><div class=\"row\">{0}</div><p class=\"hint\">Щодня о 03:40. У Signal копія йде вам приватно, коли конфігурація змінилась, і щонеділі. Відкрити архів можна лише вашим ключем: sudo wgctl backup verify перевіряє ключ, sudo wgctl backup restore відновлює.</p>", self.bform(s, "backup", T("Зробити копію і надіслати в Signal"), "btn pri"))
+                  + (T("<h2 class=\"sub\">Останні копії</h2><div class=\"lines\">{0}</div>", files) if files else ""))
+        parts.append(T("<section><h2>Резервні копії</h2><div class=\"panel\">{0}</div></section>", bk))
+        return self.layout(s, T("Сервер"), hero, "".join(parts), "server", cls)
+
+    # -- settings
+    def page_settings(self, s, tok, method, f):
+        codes = None
+        if method == "POST":
+            a = f.get("act")
+            if a == "logout_all":
+                with _lock:
+                    for t in [t for t in SESSIONS if t != tok]:
+                        SESSIONS.pop(t, None)
+                self.flash(s, "ok", T("Інші сесії завершено"))
+            elif a == "notify":
+                cur = wgj("notify", "show")
+                admins = [x for x in re.split(r"[\s,;]+", str(f.get("admins", ""))) if x]
+                group = str(f.get("group", ""))
+                args = ["notify", "set", "--connect", "on" if f.get("connect") else "off",
+                        "--report", "on" if f.get("report") else "off", "--users", "on" if f.get("users") else "off"]
+                sens = set(admins) != set(cur.get("admins", [])) or group != cur.get("group", "")
+                if sens and not self.need_code(s, {"code": f.get("code", "")}):
+                    self.flash(s, "bad", T("Щоб змінити адміністраторів чи групу, потрібен код із застосунку"))
+                    raise Redirect("/settings")
+                if set(admins) != set(cur.get("admins", [])):
+                    args.append(opt("admins", ",".join(admins) or "none"))
+                if group != cur.get("group", ""):
+                    names = {g["id"]: g["name"] for g in self.groups()}
+                    args += [opt("group", group or "none"), opt("group-name", names.get(group, ""))]
+                self.act(s, args, T("Налаштування сповіщень збережено"))
+            elif a == "notify_group":
+                if not self.need_code(s, {"code": f.get("code", "")}):
+                    self.flash(s, "bad", T("Потрібен правильний код із застосунку"))
+                else:
+                    gname = str(f.get("gname", "")).strip().lstrip("-").strip()[:60] or BRAND
+                    self.act(s, ["notify", "create-group", gname], "")
+            elif a == "language":
+                v = str(f.get("language", ""))
+                if v in LANGUAGES and v != LANG and self.act(s, ["config", "--language", v], "✓"):
+                    restart_soon()
+            elif a == "rotate":
+                v = str(f.get("rotate_days", ""))
+                if v in {str(d) for d, _ in ROTATE_CHOICES}:
+                    self.act(s, ["config", "--rotate-days", v], T("Нагадування збережено"))
+            elif a == "notify_test":
+                rc, out, err = wg("notify", "test")
+                self.flash(s, "ok" if rc == 0 else "bad", (out.strip() or T("Надіслано")) if rc == 0 else err)
+            elif a in ("passwd", "backup"):
+                if not self.need_code(s, {"code": f.get("code", "")}):
+                    self.flash(s, "bad", T("Потрібен правильний код із застосунку"))
+                elif a == "passwd":
+                    with _auth_lock:
+                        auth = load_auth()
+                        p1, p2 = str(f.get("new", "")), str(f.get("new2", ""))
+                        if not check_pw(auth["pw"], str(f.get("old", ""))):
+                            self.flash(s, "bad", T("Поточний пароль невірний"))
+                        elif len(p1) < 12 or len(p1) > 1024 or p1 != p2 or p1 == auth["user"]:
+                            self.flash(s, "bad", T("Новий пароль: від 12 символів, не логін, обидва поля однакові"))
+                        else:
+                            auth["pw"], auth["pw_changed"] = make_pw(p1), int(time.time())
+                            auth["epoch"] = auth.get("epoch", 1) + 1
+                            save_auth(auth)
+                            s["epoch"] = auth["epoch"]
+                            with _lock:
+                                for t in [t for t in SESSIONS if t != tok]:
+                                    SESSIONS.pop(t, None)
+                            event(T("Змінено пароль панелі"), "critical", "🔑")
+                            self.flash(s, "ok", T("Пароль змінено, інші сесії завершено"))
+                else:
+                    with _auth_lock:
+                        auth = load_auth()
+                        codes, auth["backup"] = make_backup_codes()
+                        save_auth(auth)
+                    event(T("Перевидано резервні коди панелі"), "warning", "🔑")
+            if not codes:
+                raise Redirect("/settings")
+        prefetch(("notify", "show"), ("notify", "groups"), ("status",))
+        auth = load_auth()
+        left = sum(1 for r in auth["backup"] if not r["used"])
+        cs = self.csrf(s)
+        hero = self.hero(T("Налаштування"), T("Обліковий запис {0}, пароль змінено {1}, резервних кодів {2} з 10.", e(auth['user']), fmt_ts(auth.get('pw_changed')), left), small=True)
+        sess = "".join(T("<div class=\"ln\"><span class=\"when\">{0}{1}</span><span class=\"muted\">вхід {2}, активність {3}</span><span class=\"muted small\">{4}</span></div>", e(v["ip"]), T(" (ця сесія)") if t == tok else "", fmt_ts(int(v["created"])), ago(int(v["seen"])), e(v["ua"][:40])) for t, v in self.sessions_snapshot())
+        codes_html = ""
+        if codes:
+            codes_html = (T("<div class=\"note warn\"><b>Нові резервні коди.</b> Збережіть їх зараз, більше вони не покажуться. Старі коди більше не діють.<div class=\"codes\">") + "".join(f"<div>{c}</div>" for c in codes) + "</div></div>")
+        low = T("<div class=\"note warn\">Резервних кодів лишилось мало. Перевидайте їх.</div>") if left <= 3 else ""
+        body = T("{0}{1}{2}\n<section><h2>Пароль</h2><div class=\"panel\"><form method=\"post\">{3}<input type=\"hidden\" name=\"act\" value=\"passwd\">\n<div class=\"g2\"><div><label class=\"f\" for=\"o\">Поточний пароль</label><input type=\"password\" id=\"o\" name=\"old\" autocomplete=\"current-password\" required></div>\n{4}\n<div><label class=\"f\" for=\"n1\">Новий пароль, мінімум 12 символів</label><input type=\"password\" id=\"n1\" name=\"new\" autocomplete=\"new-password\" minlength=\"12\" required></div>\n<div><label class=\"f\" for=\"n2\">Ще раз</label><input type=\"password\" id=\"n2\" name=\"new2\" autocomplete=\"new-password\" minlength=\"12\" required></div></div>\n<div class=\"row\"><button class=\"btn pri\">Змінити пароль</button></div></form></div></section>\n{5}\n<section><h2>Резервні коди</h2><div class=\"panel\"><p class=\"muted small\">Кожен код діє один раз замість коду з телефона.</p>\n<form method=\"post\" class=\"row\" data-confirm=\"Старі резервні коди перестануть діяти. Продовжити?\">{6}<input type=\"hidden\" name=\"act\" value=\"backup\">\n{7}<button class=\"btn\">Перевидати коди</button></form>\n<p class=\"small muted\">Втратили телефон: увійдіть резервним кодом, відновіть коди із секрету TOTP з менеджера паролів або через SSH виконайте vpnadmin reset-totp.</p></div></section>\n<section><h2>Сесії</h2><div class=\"lines\">{8}</div>\n<div class=\"row\"><form method=\"post\">{9}<input type=\"hidden\" name=\"act\" value=\"logout_all\"><button class=\"btn\">Завершити інші сесії</button></form>\n<form method=\"post\" action=\"/logout\">{10}<button class=\"btn\">Вийти з панелі</button></form></div></section>", codes_html, low, self.notify_block(s), cs, self.code_field('cd1', True), self.keys_block(s), cs, self.code_field('cd2', True), sess, cs, cs)
+        return self.layout(s, T("Налаштування"), hero, body, "settings", self.sys_state()[0])
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+SESSIONS_FILE = f"{AUTH_DIR}/sessions.restart.json"
+
+
+def restart_soon():
+    """Restart the panel in a moment (e.g. new language): sessions are handed over through a short-lived file."""
+    def go():
+        time.sleep(0.6)
+        with _lock:
+            data = json.dumps({"ts": time.time(), "sessions": SESSIONS})
+        fd = os.open(SESSIONS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(data)
+        os.execv(sys.executable, getattr(sys, "orig_argv", [sys.executable] + sys.argv))   # keeps flags such as -I
+    threading.Thread(target=go, daemon=True).start()
+
+
+def restore_sessions():
+    try:
+        with open(SESSIONS_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    finally:
+        try:
+            os.remove(SESSIONS_FILE)
+        except OSError:
+            pass
+    if time.time() - data.get("ts", 0) < 30:             # only a restart we just did ourselves
+        SESSIONS.update({k: v for k, v in data.get("sessions", {}).items() if isinstance(v, dict) and v.get("tok") == k})
+
+
+def serve():
+    restore_sessions()
+    if not os.path.exists(AUTH_FILE):
+        sys.stderr.write(T("Обліковий запис не створено: vpnadmin setup\n"))
+    srv = Server((BIND, PORT), H)
+    sys.stderr.write(T("vpnadmin {0} на {1}:{2}\n", VERSION, BIND, PORT))
+    srv.serve_forever()
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "serve":
+        serve()
+    elif cmd == "setup":
+        cli_setup("--force" in sys.argv)
+    elif cmd == "passwd":
+        cli_passwd()
+    elif cmd == "reset-totp":
+        cli_reset_totp()
+    elif cmd == "backup-codes":
+        cli_backup_codes()
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

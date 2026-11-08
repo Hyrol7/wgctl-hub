@@ -1,0 +1,20 @@
+[Unit]
+Description=vpnadmin: web panel for the wgctl VPN hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vpnadmin
+Group=vpnadmin
+ExecStart=/usr/local/sbin/vpnadmin serve
+Restart=on-failure
+RestartSec=3
+# The panel listens on 127.0.0.1 only; Caddy proxies it for admin keys.
+Environment=VPNADMIN_BIND=127.0.0.1 VPNADMIN_PORT=8090
+# No filesystem sandboxing here on purpose: the panel runs `sudo wgctl`, which inherits
+# this unit's mount namespace and must be able to write /etc/wgctl, /etc/caddy, /etc/wireguard.
+# The panel itself is confined by running as an unprivileged user and by sudoers.
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

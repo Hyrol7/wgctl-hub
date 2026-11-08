@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest pyflakes
+      - name: Lint
+        run: pyflakes src/wgctl src/vpnadmin tools/*.py tests/*.py
+      - name: Translations complete
+        run: python3 tools/i18n.py check
+      - name: Tests
+        run: python3 -m pytest -q tests
+
+  caddy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Caddy with the Cloudflare DNS module
+        run: |
+          curl -fsSL -o caddy "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com%2Fcaddy-dns%2Fcloudflare"
+          chmod +x caddy
+      - name: Validate a generated Caddyfile
+        run: tests/caddy_validate.sh "$PWD/caddy"
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh uninstall.sh src/wgctl-update tests/caddy_validate.sh tests/nft_check.sh
+      - name: nftables template parses
+        run: |
+          sudo apt-get install -y nftables
+          tests/nft_check.sh
+
+  install:
+    # A real first install on a fresh Ubuntu 24.04 VM, then a few commands and the uninstaller.
+    # The firewall step is answered "no" so the runner keeps its network.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh (packages yes, firewall no, panel account no)
+        run: printf 'y\nn\nn\n' | sudo ./install.sh --domain=ci.example.org
+      - name: Use it
+        run: |
+          set -x
+          sudo wgctl status
+          sudo wgctl location add home --title Home --networks 192.168.1.0/24
+          sudo wgctl location conf home --format mikrotik | grep -q '/interface wireguard add'
+          sudo wgctl site add nas http://192.168.1.10:5000
+          sudo wgctl add ci-phone --sites nas --admin
+          sudo wgctl render
+          sudo env CF_API_TOKEN=dummy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          sudo wg show
+          sudo wgctl server
+          sudo wgctl-update --help
+      - name: Upgrade in place
+        run: sudo ./install.sh --upgrade
+      - name: Uninstall keeps data, purge removes it
+        run: |
+          sudo ./uninstall.sh --yes
+          test ! -e /usr/local/sbin/wgctl && test -f /etc/wgctl/state.json
+          sudo ./uninstall.sh --purge --yes
+          test ! -e /etc/wgctl

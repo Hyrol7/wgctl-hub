@@ -1,0 +1,4112 @@
+#!/usr/bin/env python3
+"""wgctl: manage a WireGuard + Caddy VPN hub (keys, locations, sites, TCP services).
+
+Settings:  /etc/wgctl/config.toml (created by wgctl init)
+State:     /etc/wgctl/state.json (keys, locations, sites, panel settings)
+Configs:   /etc/wgctl/clients/<name>.conf (to show a config or QR again)
+WireGuard: a managed block at the end of /etc/wireguard/wg0.conf
+Caddy:     /etc/caddy/wgctl.caddy (fully generated, do not edit by hand)
+Stubs:     /var/lib/wgctl/stub/*.html
+"""
+import argparse
+import datetime as dt
+import fcntl
+import fnmatch
+import glob
+import hashlib
+import io
+import ipaddress
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from zoneinfo import ZoneInfo
+
+VERSION = "1.0.0"
+
+# ---- paths (WGCTL_ROOT is for tests only) -----------------------------------
+ROOT = os.environ.get("WGCTL_ROOT", "")
+
+
+def P(path):
+    return ROOT + path
+
+
+# ---- settings (/etc/wgctl/config.toml) ---------------------------------------
+CONFIG_FILE = os.environ.get("WGCTL_CONFIG") or P("/etc/wgctl/config.toml")
+
+
+def _load_config():
+    import tomllib
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as ex:
+        sys.exit(f"{os.environ.get('WGCTL_CONFIG') or '/etc/wgctl/config.toml'}: {ex}")
+
+
+CFG = _load_config()
+
+
+def cfg(section, key, default):
+    return CFG.get(section, {}).get(key, default)
+
+
+# ---- translation: Ukrainian templates in code, translations in share/i18n/<lang>.json ----
+LANG = cfg("general", "language", "en")
+SHARE = os.environ.get("WGCTL_SHARE", "/usr/local/share/wgctl")
+
+
+def _load_catalog(lang):
+    if lang == "uk":
+        return {}
+    try:
+        with open(f"{SHARE}/i18n/{lang}.json", encoding="utf-8") as f:
+            return {k: v for k, v in json.load(f).items() if v}
+    except (OSError, ValueError):
+        return {}
+
+
+_CAT = _load_catalog(LANG)
+# "uk" is the source language; every share/i18n/<code>.json adds another one
+LANGUAGES = ["uk"] + sorted(f[:-5] for f in (os.listdir(f"{SHARE}/i18n") if os.path.isdir(f"{SHARE}/i18n") else [])
+                            if f.endswith(".json") and f[:-5] != "uk")
+
+
+def T(tpl, *args):
+    """Translate a template into the language from config.toml; without a translation it stays Ukrainian."""
+    return _CAT.get(tpl, tpl).format(*args)
+
+
+IFACE = cfg("network", "interface", "wg0")
+WG_CONF = P(f"/etc/wireguard/{IFACE}.conf")
+STATE_DIR = P("/etc/wgctl")
+STATE = f"{STATE_DIR}/state.json"
+CONF_DIR = f"{STATE_DIR}/clients"
+BACKUP_DIR = f"{STATE_DIR}/backup"
+STUB_DIR = P("/var/lib/wgctl/stub")
+CADDYFILE = P("/etc/caddy/Caddyfile")
+CADDY_GEN = P("/etc/caddy/wgctl.caddy")
+CADDY_ENV = P("/etc/caddy/cloudflare.env")
+CADDY_CERTS = P("/var/lib/caddy/.local/share/caddy/certificates")
+LOG = P("/var/log/wgctl.log")
+LOCK = P("/run/wgctl.lock")
+OUTBOX = P("/var/lib/wgctl/outbox.json")
+OUTBOX_LOCK = P("/run/wgctl-outbox.lock")
+SIGNAL_DIR = P("/var/lib/signal-cli")
+SIGNAL_USER = "signal"
+SIGNAL_FAKE = os.environ.get("WGCTL_SIGNAL_FAKE")    # tests: a file instead of really sending
+CAT_UA = {"security": T("безпека"), "access": T("доступ"), "warn": T("попередження"), "health": T("стан"),
+          "connect": T("підключення"), "info": T("інфо")}
+DRY = bool(os.environ.get("WGCTL_DRY"))              # do not touch wg and systemctl
+CADDY_BIN = os.environ.get("WGCTL_CADDY_BIN", "caddy")
+TEST_TLS = os.environ.get("WGCTL_TEST_TLS")          # e.g. "internal" in tests
+
+DOMAIN = cfg("network", "domain", "example.com")
+PANEL_SUB = cfg("panel", "subdomain", "vpnadmin")
+PANEL_HOST = f"{PANEL_SUB}.{DOMAIN}"
+PUBLIC_IP = cfg("network", "public_ip", "203.0.113.10")
+LISTEN_PORT = int(cfg("network", "listen_port", 51820))
+ENDPOINT = f"{cfg('network', 'endpoint_host', PUBLIC_IP)}:{LISTEN_PORT}"
+_NETW = ipaddress.ip_network(cfg("network", "subnet", "10.77.0.0/24"))
+if _NETW.prefixlen != 24 or _NETW.version != 4:
+    sys.exit(T("wgctl: network.subnet має бути IPv4 /24, напр. 10.77.0.0/24"))
+NET = str(_NETW.network_address).rsplit(".", 1)[0] + "."      # "10.77.0."
+HUB_IP = NET + "1"
+LOC_MIN = int(cfg("network", "locations_from", 2))     # addresses for locations (routers)
+LOC_MAX = int(cfg("network", "locations_to", 9))
+IP_MIN, IP_MAX = int(cfg("network", "clients_from", 10)), int(cfg("network", "clients_to", 250))
+CF_API = "https://api.cloudflare.com/client/v4"
+ONLINE_SEC = 180
+INACTIVE_DAYS = int(cfg("policy", "inactive_days", 60))
+WARN_DAYS = int(cfg("policy", "warn_days", 7))
+BRAND = cfg("panel", "brand", "VPN hub")
+LOCATION_WARN_SEC, LOCATION_DOWN_SEC = 180, 600
+EXPIRY_WARN_DAYS = 3
+GUEST_MAX_HOURS = int(cfg("policy", "guest_max_hours", 72))     # guest key: from 1 hour
+GUEST_WARN_SEC = 15 * 60                 # warn the admin 15 minutes before the end
+ROTATE_DEFAULT = int(cfg("policy", "rotate_days", 180))         # remind to rotate a key (0 = off)
+FLAP_WINDOW, FLAP_COUNT = 600, 3        # double activity: 3 IP changes within 10 minutes
+GEO_DIR = P("/var/lib/wgctl/geoip")
+TRAVEL_KMH, TRAVEL_MIN_KM = 900, 300    # "impossible travel"
+HOSTING_WORDS = ("hosting", "host", "cloud", "datacenter", "data center", "server", "vps", "colo",
+                 "hetzner", "ovh", "digitalocean", "amazon", "aws", "google", "microsoft", "azure",
+                 "linode", "akamai", "vultr", "contabo", "m247", "leaseweb", "choopa", "scaleway",
+                 "oracle", "alibaba", "tencent", "netcup", "ionos", "hostinger", "datacamp", "cdn77",
+                 "mullvad", "nordvpn", "proton", "expressvpn", "surfshark", "private internet access")
+KEEP_BACKUPS = 30
+TZ = ZoneInfo(cfg("general", "timezone", "UTC"))
+BEGIN = "# >>> wgctl managed clients - do not edit by hand >>>"
+END = "# <<< wgctl managed clients <<<"
+NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,29}[a-z0-9])?$")   # like a DNS label: no trailing hyphen
+RESERVED = {PANEL_SUB, "www"} | set(cfg("network", "reserved_names", []))
+
+
+def _check_config():
+    """Values from config.toml end up in Caddy and WireGuard configs and in commands: check them right away."""
+    bad = []
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", DOMAIN):
+        bad.append("network.domain")
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?", PANEL_SUB):
+        bad.append("panel.subdomain")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", IFACE):
+        bad.append("network.interface")
+    try:
+        if ipaddress.ip_address(PUBLIC_IP).version != 4:
+            bad.append("network.public_ip")
+    except ValueError:
+        bad.append("network.public_ip")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", cfg("network", "endpoint_host", PUBLIC_IP)):
+        bad.append("network.endpoint_host")
+    if not 1 <= LISTEN_PORT <= 65535:
+        bad.append("network.listen_port")
+    if not 2 <= LOC_MIN <= LOC_MAX < IP_MIN:
+        bad.append("network.locations_from/locations_to (2..clients_from-1)")
+    if not 3 <= IP_MIN <= IP_MAX <= 254:
+        bad.append("network.clients_from/clients_to (3..254)")
+    if not _NETW.is_private:
+        bad.append("network.subnet (private)")
+    if any(c in BRAND for c in '"\\\n\r<>'):
+        bad.append("panel.brand")
+    if bad:
+        sys.exit(f"wgctl: {CONFIG_FILE}: " + ", ".join(bad))
+
+
+if CFG:
+    _check_config()
+STATUS_UA = {"active": T("активний"), "disabled": T("вимкнений"), "revoked": T("відкликаний")}
+REASON_UA = {"manual": T("вручну"), "expired": T("минув термін"), "suspicious": T("підозріла активність"), "": ""}
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+GROUP_RE = re.compile(r"[A-Za-z0-9+/_-]{20,64}={0,2}")
+
+
+# ---- small helpers ----------------------------------------------------------
+def now():
+    return int(os.environ.get("WGCTL_NOW") or time.time())
+
+
+def fmt_ts(ts):
+    return dt.datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M") if ts else "-"
+
+
+def ago(ts):
+    if not ts:
+        return T("ніколи")
+    s = max(0, now() - ts)
+    if s < 60:
+        return T("{0} с тому", s)
+    if s < 3600:
+        return T("{0} хв тому", s // 60)
+    if s < 86400:
+        return T("{0} год тому", s // 3600)
+    return T("{0} дн тому", s // 86400)
+
+
+def human(b):
+    b = float(b)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if b < 1024 or unit == "TiB":
+            return f"{b:.0f} {unit}" if unit == "B" else f"{b:.1f} {unit}"
+        b /= 1024
+
+
+def die(msg):
+    sys.exit(msg)
+
+
+LOG_MAX = 4 * 1024 * 1024
+
+
+def log(msg):
+    """One record = one line: line breaks in user text cannot forge events."""
+    msg = re.sub(r"[\r\n\x00-\x08\x0b-\x1f]+", " ", str(msg))
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > LOG_MAX:
+            os.replace(LOG, LOG + ".1")          # keep one previous part
+        fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+        with os.fdopen(fd, "a") as f:
+            f.write(f"{fmt_ts(now())} {msg}\n")
+    except OSError:
+        pass
+
+
+def clean_note(v):
+    return re.sub(r"\s+", " ", v or "").strip()[:80]
+
+
+def clean_phone(v):
+    return re.sub(r"[\s()-]", "", v or "")
+
+
+# Notification levels. The group chat gets everything; admins privately get only critical events (also sent to the group).
+# Until a group is set, everything goes to admins privately.
+LEVELS = ("critical", "warning", "info")
+LEVEL_BY_CAT = {"security": "critical", "health": "warning", "warn": "warning", "access": "info", "connect": "info",
+                "info": "info"}
+ICON_BY_LEVEL = {"critical": "🚨", "warning": "⚠️"}
+ICON_BY_CAT = {"access": "🔑", "connect": "🔌", "health": "✅", "security": "🛡", "info": "ℹ️", "warn": "⚠️"}
+
+
+def event_icon(cat, level):
+    return ICON_BY_LEVEL.get(level) or ICON_BY_CAT.get(cat, "ℹ️")
+
+
+def ev(text, cat="access", client=None, user=None, level=None, icon=None, link=None):
+    """An event: text for the admin, category, client, (optional) text for the user themselves,
+    level (critical | warning | info; by default from the category), icon and panel page."""
+    return {"text": text, "cat": cat, "client": client, "user": user, "level": level, "icon": icon, "link": link}
+
+
+def notify(msg, cat="access", client=None, user=None, level=None, icon=None, link=None):
+    """Log + Signal notification queue. Never breaks the main action."""
+    level = level if level in LEVELS else LEVEL_BY_CAT.get(cat, "info")
+    log(f"EVENT:{cat} {msg}")
+    try:
+        cfg, phone, panel_on, is_client = notify_cfg(), "", False, False
+        try:
+            with open(STATE) as f:
+                stj = json.load(f)
+            panel_on = bool(stj.get("panel", {}).get("enabled"))
+            if client:
+                is_client = client in stj["clients"]
+                phone = (stj["clients"].get(client) or {}).get("phone", "")
+        except (OSError, ValueError, KeyError):
+            pass
+        if link is None and is_client and level != "info":
+            link = f"/c/{client}"
+        url = f"https://{PANEL_HOST}{link}" if link and panel_on else ""
+        icon = icon or event_icon(cat, level)
+        item = {"kind": "admin", "text": msg, "level": level, "icon": icon, "url": url}
+        items = []
+        if (cat != "connect" or cfg.get("connect")) and cat != "info":
+            items += [{**t, **item} for t in admin_targets(cfg, level)]
+        if user and phone and cfg.get("users", True):
+            items.append({"to": phone, "group": False, "kind": "user", "text": f"{icon} {fmt_ts(now())[11:]}  {user}"})
+        if items:
+            enqueue(items)
+    except Exception as e:
+        log(f"notify error: {e!r}")
+
+
+def notify_events(events):
+    for e in events:
+        notify(e["text"], e["cat"], e.get("client"), e.get("user"), e.get("level"), e.get("icon"), e.get("link"))
+
+
+def run(cmd, inp=None, check=True, env=None):
+    r = subprocess.run(cmd, input=inp, capture_output=True, text=True, env=env,
+                       stdin=None if inp is not None else subprocess.DEVNULL)
+    if check and r.returncode != 0:
+        die(T("Помилка: {0}: {1}", ' '.join(cmd), (r.stderr or r.stdout).strip()))
+    return r
+
+
+def write_file(path, text, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with open(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def shred(path):
+    if os.path.exists(path):
+        if shutil.which("shred"):
+            subprocess.run(["shred", "-u", path])
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def backup(path):
+    if not os.path.exists(path):
+        return
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    stamp = dt.datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, f"{BACKUP_DIR}/{os.path.basename(path)}.{stamp}")
+    base = os.path.basename(path) + "."
+    old = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith(base))
+    for name in old[:-KEEP_BACKUPS]:
+        os.remove(os.path.join(BACKUP_DIR, name))
+
+
+def parse_date(s):
+    if s in (None, "", "none", "ні"):
+        return None
+    try:
+        d = dt.date.fromisoformat(s)
+    except ValueError:
+        die(T("Дата у форматі РРРР-ММ-ДД, напр. 2026-12-31, або none"))
+    if d < dt.datetime.now(TZ).date():
+        die(T("Дата {0} уже минула", d.isoformat()))
+    return d.isoformat()
+
+
+def qr(path, svg=False):
+    if not shutil.which("qrencode"):
+        die(T("Немає qrencode. Встановіть: apt install -y qrencode"))
+    if svg:
+        return run(["qrencode", "-t", "SVG", "-r", path]).stdout
+    subprocess.run(["qrencode", "-t", "ansiutf8", "-r", path])
+
+
+def onoff(s):
+    if s in ("on", "yes", "так", "1", "true"):
+        return True
+    if s in ("off", "no", "ні", "0", "false"):
+        return False
+    die(T("Значення: on або off"))
+
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+        self.f = open(LOCK, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ---- state ------------------------------------------------------------------
+def new_client(ip, pubkey, psk, **kw):
+    c = {"ip": ip, "pubkey": pubkey, "psk": psk, "status": "active", "disabled_reason": "",
+         "created": now(), "last_seen": 0, "reactivated": 0, "online": False, "warned": False,
+         "endpoint": "", "endpoints": [], "suspect": "", "suspect_at": 0, "note": "",
+         "countries": [], "trusted_orgs": [], "notes": "", "phone": "",
+         "revoked_at": 0, "expires": None, "autorevoke": True, "admin": False, "sites": [],
+         "conf": False, "guest_until": 0, "guest_hours": 0, "guest_warned": False,
+         "rotated": 0, "rotate_warned": False}
+    c.update(kw)
+    return c
+
+
+def load():
+    if not os.path.exists(STATE):
+        die(T("Хаб ще не налаштовано. Виконайте: sudo wgctl init"))
+    with open(STATE) as f:
+        st = json.load(f)
+    for c in st["clients"].values():          # new fields in old records
+        for k, v in new_client("", "", "").items():
+            c.setdefault(k, v)
+        if not c.get("rotated"):                 # for old keys: count from the moment of issue
+            c["rotated"] = c.get("created") or now()
+    # Locations: only real routers with a key. Placeholders from older versions (no key) are dropped.
+    st["locations"] = {n: l for n, l in st.get("locations", {}).items() if l.get("pubkey") and l.get("ip")}
+    for l in st["locations"].values():
+        l.pop("configured", None)
+        l.setdefault("sites", [])
+        l.setdefault("networks", [])
+        l.setdefault("title", "")
+    return st
+
+
+def save(st):
+    write_file(STATE, json.dumps(st, ensure_ascii=False, indent=2) + "\n")
+
+
+def octet(ip):
+    return int(ip.rsplit(".", 1)[1])
+
+
+def get_client(st, name):
+    c = st["clients"].get(name)
+    if not c:
+        die(T("Клієнта {0} немає. Список: wgctl list --all", name))
+    return c
+
+
+def get_site(st, name):
+    s = st["sites"].get(name)
+    if not s:
+        die(T("Сайту {0} немає. Список: wgctl site list", name))
+    return s
+
+
+def principal(st, name):
+    """A client or a location that can be given sites."""
+    if name in st["clients"]:
+        return st["clients"][name]
+    if name in st["locations"]:
+        return st["locations"][name]
+    die(T("Немає клієнта чи локації {0}", name))
+
+
+def has_site(p, site):
+    return p.get("sites") == "*" or site in (p.get("sites") or [])
+
+
+def idle_from(c):
+    return max(c.get("last_seen", 0), c.get("reactivated", 0)) or c["created"]
+
+
+# ---- WireGuard -------------------------------------------------------------
+def base_conf(text):
+    if BEGIN in text:
+        pre, rest = text.split(BEGIN, 1)
+        post = rest.split(END, 1)[1] if END in rest else ""
+        text = pre.rstrip() + "\n" + post.lstrip("\n")
+    return text.rstrip() + "\n"
+
+
+def render_wg(st):
+    lines = [BEGIN]
+    live = [(n, c) for n, c in st["clients"].items() if c["status"] in ("active", "disabled")]
+    for name, c in sorted(live, key=lambda x: octet(x[1]["ip"])):
+        lines += ["", "[Peer]", f"# client: {name}", f"PublicKey = {c['pubkey']}"]
+        if c.get("psk"):
+            lines.append(f"PresharedKey = {c['psk']}")
+        lines.append(f"AllowedIPs = {c['ip']}/32")
+    for name, l in sorted(st["locations"].items()):
+        if l.get("managed") and l.get("pubkey"):           # locations added with wgctl location add
+            lines += ["", "[Peer]", f"# location: {name}", f"PublicKey = {l['pubkey']}"]
+            if l.get("psk"):
+                lines.append(f"PresharedKey = {l['psk']}")
+            lines.append("AllowedIPs = " + ", ".join([f"{l['ip']}/32"] + l.get("networks", [])))
+    lines += ["", END]
+    return "\n".join(lines) + "\n"
+
+
+def apply_wg(st):
+    with open(WG_CONF) as f:
+        text = f.read()
+    new = base_conf(text) + "\n" + render_wg(st)
+    if new == text:
+        return
+    backup(WG_CONF)
+    write_file(WG_CONF, new)
+    if DRY:
+        return
+    r = subprocess.run(["bash", "-c", f"wg syncconf {IFACE} <(wg-quick strip {IFACE})"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(T("Помилка застосування WireGuard: ") + r.stderr.strip())
+
+
+def dump():
+    """pubkey -> endpoint, handshake, rx, tx."""
+    if os.environ.get("WGCTL_DUMP"):
+        with open(os.environ["WGCTL_DUMP"]) as f:
+            lines = f.read().splitlines()
+    else:
+        lines = run(["wg", "show", IFACE, "dump"]).stdout.splitlines()
+    peers = {}
+    for line in lines[1:]:
+        p = line.split("\t")
+        if len(p) >= 7:
+            peers[p[0]] = {"endpoint": p[2], "hs": int(p[4]), "rx": int(p[5]), "tx": int(p[6])}
+    return peers
+
+
+def server_pubkey():
+    if os.environ.get("WGCTL_SRV_PUB"):
+        return os.environ["WGCTL_SRV_PUB"]
+    return run(["wg", "show", IFACE, "public-key"]).stdout.strip()
+
+
+def genkeys():
+    priv = run(["wg", "genkey"]).stdout.strip()
+    pub = run(["wg", "pubkey"], priv).stdout.strip()
+    psk = run(["wg", "genpsk"]).stdout.strip()
+    return priv, pub, psk
+
+
+def client_conf(priv, ip, psk):
+    return ("[Interface]\n"
+            f"PrivateKey = {priv}\n"
+            f"Address = {ip}/32\n\n"
+            "[Peer]\n"
+            f"PublicKey = {server_pubkey()}\n"
+            f"PresharedKey = {psk}\n"
+            f"Endpoint = {ENDPOINT}\n"
+            f"AllowedIPs = {HUB_IP}/32\n"
+            "PersistentKeepalive = 25\n")
+
+
+# ---- Caddy -----------------------------------------------------------------
+STUBS = {
+    "disabled": (T("Доступ вимкнено"),
+                 T("Доступ цього пристрою до сайтів вимкнено адміністратором або закінчився термін його дії. Зверніться до адміністратора, щоб його поновити.")),
+    "noaccess": (T("Немає доступу"),
+                 T("Цьому пристрою не надано доступу до цього сайту. Якщо він вам потрібен, попросіть адміністратора додати його.")),
+    "notfound": (T("Сайт не знайдено"),
+                 T("За цією адресою немає опублікованого сайту. Перевірте написання адреси.")),
+    "unavailable": (T("Сайт тимчасово недоступний"),
+                    T("Сервер, на якому працює сайт, зараз не відповідає. Спробуйте трохи пізніше.")),
+}
+
+
+def stub_html(title, text):
+    return f"""<!doctype html>
+<html lang="{LANG}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} · {BRAND}</title>
+<style>
+:root{{--bg:#EEF0F7;--card:#fff;--fg:#1E1B4B;--muted:#636A8A;--accent:#3B2FC9}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#121329;--card:#1C1E3A;--fg:#ECEBFF;--muted:#A3A6C6;--accent:#7C74FF}}}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px}}
+main{{max-width:440px;width:100%;background:var(--card);border-radius:24px;padding:28px}}
+.k{{display:flex;align-items:center;gap:10px;font-weight:700;margin:0 0 14px}}
+.k::before{{content:"";width:14px;height:14px;border-radius:50%;background:var(--accent)}}
+h1{{font-size:22px;font-weight:650;margin:0 0 10px;letter-spacing:-.02em}}p{{margin:0;color:var(--muted)}}
+</style></head><body><main>
+<p class="k">{BRAND}</p><h1>{title}</h1><p>{text}</p>
+</main></body></html>
+"""
+
+
+def write_stubs():
+    os.makedirs(STUB_DIR, exist_ok=True)
+    os.chmod(STUB_DIR, 0o755)
+    for name, (title, text) in STUBS.items():
+        write_file(f"{STUB_DIR}/{name}.html", stub_html(title, text), 0o644)
+
+
+def stub_lines(page, code, indent):
+    t = "\t" * indent
+    return [f"{t}rewrite * /{page}.html", f"{t}file_server {{", f"{t}\troot {STUB_DIR}",
+            f"{t}\tstatus {code}", f"{t}}}"]
+
+
+# Headers trusted only from Cloudflare. On the VPN path they are removed, so a key with access
+# to a public site cannot hand the backend someone else's "real" client address.
+CF_HEADERS = ("Cf-Connecting-Ip", "Cf-Connecting-Ipv6", "Cf-Ipcountry", "True-Client-Ip")
+
+
+def proxy_lines(site, indent, strip_cf=False):
+    t = "\t" * indent
+    b = site["backend"]
+    sub = [f"{t}\theader_up -{h}" for h in CF_HEADERS] if strip_cf else []
+    if site.get("insecure") and b.startswith("https://"):
+        sub += [f"{t}\ttransport http {{", f"{t}\t\ttls_insecure_skip_verify", f"{t}\t}}"]
+    if site.get("upstream_host"):
+        sub.append(f"{t}\theader_up Host {{upstream_hostport}}")
+    if not sub:
+        return [f"{t}reverse_proxy {b}"]
+    return [f"{t}reverse_proxy {b} {{"] + sub + [f"{t}}}"]
+
+
+def allowed_ips(st, site_name):
+    ips = [c["ip"] for c in st["clients"].values()
+           if c["status"] == "active" and has_site(c, site_name)]
+    ips += [l["ip"] for l in st["locations"].values()
+            if has_site(l, site_name)]
+    return sorted(set(ips), key=octet)
+
+
+def panel_ips(st):
+    ips = [c["ip"] for c in st["clients"].values() if c["status"] == "active" and c.get("admin")]
+    ips += [l["ip"] for l in st["locations"].values()
+            if l.get("panel")]
+    return sorted(set(ips), key=octet)
+
+
+def render_caddy(st):
+    tls = (["\ttls internal"] if TEST_TLS == "internal" else
+           ["\ttls {", "\t\tdns cloudflare {env.CF_API_TOKEN}", "\t\tresolvers 1.1.1.1", "\t}"])
+    L = [T("# Згенеровано wgctl. Не редагуйте вручну: зміни зітруться."),
+         f"*.{DOMAIN} {{"] + tls
+    # A site with a "hide-path" log goes to a separate filtered log (log_name), the rest as usual
+    if any(s.get("log") == "hide-path" for s in st["sites"].values()):
+        L += ["\tlog_name wgctl"] + caddy_log_lines(1, name="wgctl") + caddy_log_lines(1, "hide-path", name="wgctl_hidden") + [""]
+    else:
+        L += caddy_log_lines(1) + [""]
+    L += ["\thandle_errors 502 503 504 {"] + stub_lines("unavailable", 503, 2) + ["\t}", ""]
+    disabled = sorted({c["ip"] for c in st["clients"].values() if c["status"] == "disabled"},
+                      key=octet)
+    if disabled:
+        L += [f"\t@wgctl_disabled remote_ip {' '.join(disabled)}", "\thandle @wgctl_disabled {"]
+        L += stub_lines("disabled", 403, 2) + ["\t}", ""]
+    panel = st.get("panel", {})
+    if panel.get("enabled"):
+        ips = panel_ips(st)
+        L += [f"\t@wgctl_panel host {PANEL_HOST}", "\thandle @wgctl_panel {"]
+        if ips:
+            L += [f"\t\t@panel_ok remote_ip {' '.join(ips)}", "\t\thandle @panel_ok {",
+                  "\t\t\theader {", "\t\t\t\tStrict-Transport-Security \"max-age=31536000\"",
+                  "\t\t\t\tX-Frame-Options DENY", "\t\t\t\tX-Content-Type-Options nosniff",
+                  "\t\t\t\tReferrer-Policy same-origin", "\t\t\t}",
+                  f"\t\t\treverse_proxy 127.0.0.1:{panel.get('port', 8090)}", "\t\t}"]
+        L += ["\t\thandle {", "\t\t\tabort", "\t\t}", "\t}", ""]
+    for name in sorted(st["sites"]):
+        s = st["sites"][name]
+        ips = allowed_ips(st, name)
+        m = name.replace("-", "_")          # different prefixes: sites "x" and "x-ok" do not produce the same matchers
+        L += [f"\t@site_{m} host {name}.{DOMAIN}", f"\thandle @site_{m} {{"] + site_log_lines(s, m, 2)
+        if ips:
+            L += [f"\t\t@allow_{m} remote_ip {' '.join(ips)}", f"\t\thandle @allow_{m} {{"]
+            L += proxy_lines(s, 3, strip_cf=True) + ["\t\t}"]
+        L += ["\t\thandle {"] + stub_lines("noaccess", 403, 3) + ["\t\t}", "\t}", ""]
+    L += ["\thandle {"] + stub_lines("notfound", 404, 2) + ["\t}", "}"]
+    for name in sorted(n for n, s in st["sites"].items() if s.get("public")):
+        L += ["", T("# Публічний сайт: лише через Cloudflare (443 на {0} відкритий тільки для Cloudflare)", PUBLIC_IP),
+              f"{name}.{DOMAIN} {{", f"\tbind {PUBLIC_IP}"] + tls + caddy_log_lines(1, st["sites"][name].get("log", "full")) + [""]
+        skip = st["sites"][name].get("log_skip") or []
+        if skip and st["sites"][name].get("log", "full") != "off":
+            L += [f"\t@nolog path {' '.join(skip)}", "\tlog_skip @nolog", ""]       # a separate block: its own log
+        L += ["\thandle_errors 502 503 504 {"] + stub_lines("unavailable", 503, 2) + ["\t}"]
+        L += proxy_lines(st["sites"][name], 1) + ["}"]
+    return "\n".join(L) + "\n"
+
+
+def caddy_env():
+    env = dict(os.environ)
+    if os.path.exists(CADDY_ENV):
+        with open(CADDY_ENV) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    env[k] = v
+    return env
+
+
+def caddy_log_owner():
+    """`caddy validate` run as root creates the access log owned by root, and then Caddy itself (user caddy)
+    cannot open it: config reloads fail with "permission denied". Give Caddy its files back."""
+    if os.geteuid() != 0:
+        return
+    import pwd
+    try:
+        pw = pwd.getpwnam("caddy")
+    except KeyError:
+        return
+    d = os.path.dirname(ACCESS_LOG)
+    os.makedirs(d, mode=0o750, exist_ok=True)
+    for path in [d] + [os.path.join(d, f) for f in os.listdir(d)]:
+        st_ = os.lstat(path)
+        if st_.st_uid == 0 and not os.path.islink(path):
+            os.chown(path, pw.pw_uid, pw.pw_gid, follow_symlinks=False)
+
+
+def apply_caddy(st):
+    write_stubs()
+    new = render_caddy(st)
+    old = open(CADDY_GEN).read() if os.path.exists(CADDY_GEN) else None
+    if new == old:
+        return
+    if old is not None:
+        backup(CADDY_GEN)
+    write_file(CADDY_GEN, new, 0o644)
+    if not caddy_env().get("CF_API_TOKEN") and not TEST_TLS:
+        # no Cloudflare token yet: Caddy cannot get certificates, so it is not running; the config waits for it
+        print(T("Caddy ще не налаштовано: додайте токен у {0}, потім sudo wgctl render && sudo systemctl restart caddy", CADDY_ENV),
+              file=sys.stderr)
+        return
+    if shutil.which(CADDY_BIN) or os.path.exists(CADDY_BIN):
+        r = run([CADDY_BIN, "validate", "--config", CADDYFILE, "--adapter", "caddyfile"],
+                check=False, env=caddy_env())
+        caddy_log_owner()
+        if r.returncode != 0:
+            if old is None:
+                os.remove(CADDY_GEN)
+            else:
+                write_file(CADDY_GEN, old, 0o644)
+            die(T("Caddy не прийняв конфіг, повернуто попередній:\n") + (r.stderr or r.stdout)[-1500:])
+    if not DRY:
+        r = run(["systemctl", "reload", "caddy"], check=False)
+        if r.returncode != 0:
+            die(T("Не вдалося перезавантажити Caddy: ") + r.stderr.strip())
+
+
+def apply(st, wg=True, caddy=True, force_tcp=False):
+    if wg:
+        apply_wg(st)
+    if caddy:
+        apply_caddy(st)
+    apply_tcp(st, force_tcp)          # TCP service permissions depend on key state
+
+
+# ---- output helpers ---------------------------------------------------------
+def rotate_days(st):
+    return int(st.get("settings", {}).get("rotate_days", ROTATE_DEFAULT))
+
+
+def hm(sec):
+    """3700 -> "1 h 1 min"."""
+    sec = max(0, int(sec))
+    h, m = sec // 3600, sec % 3600 // 60
+    return (T("{0} год ", h) if h else "") + T("{0} хв", m) if h or m else T("менше хвилини")
+
+
+def client_view(name, c, peers, rdays=ROTATE_DEFAULT):
+    p = peers.get(c["pubkey"]) if c["status"] != "revoked" else None
+    hs = p["hs"] if p else 0
+    last = max(hs, c.get("last_seen", 0))
+    online = bool(hs) and now() - hs < ONLINE_SEC
+    left = None
+    guest = bool(c.get("guest_until"))
+    if c["status"] == "active" and c.get("autorevoke", True) and not guest:
+        left = INACTIVE_DAYS - (now() - idle_from(c)) // 86400
+    age = (now() - c.get("rotated", c["created"])) // 86400
+    return {
+        "name": name, "ip": c["ip"], "status": c["status"],
+        "disabled_reason": c.get("disabled_reason", ""),
+        "online": online, "last_seen": last, "endpoint": (p or {}).get("endpoint") or c.get("endpoint", ""),
+        "rx": (p or {}).get("rx", 0), "tx": (p or {}).get("tx", 0),
+        "created": c["created"], "note": c.get("note", ""), "expires": c.get("expires"),
+        "autorevoke": c.get("autorevoke", True), "autorevoke_in_days": left,
+        "admin": c.get("admin", False), "sites": c.get("sites", []),
+        "conf_file": f"{CONF_DIR}/{name}.conf" if c.get("conf") else None,
+        "suspect": c.get("suspect", ""), "suspect_at": c.get("suspect_at", 0),
+        "endpoints": c.get("endpoints", [])[-50:], "revoked_at": c.get("revoked_at", 0),
+        "geo": (c.get("endpoints") or [{}])[-1], "countries": c.get("countries", []),
+        "notes": c.get("notes", ""), "phone": c.get("phone", ""),
+        "services": [],
+        "guest": guest, "guest_until": c.get("guest_until", 0), "guest_hours": c.get("guest_hours", 0),
+        "guest_left": max(0, c.get("guest_until", 0) - now()) if guest else None,
+        "rotated": c.get("rotated", c["created"]), "rotate_age": age, "rotate_days": rdays,
+        "rotate_due": bool(rdays) and not guest and c["status"] == "active" and age >= rdays,
+    }
+
+
+def table(rows):
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(str(v).ljust(widths[i]) for i, v in enumerate(r)).rstrip())
+
+
+def sites_str(v):
+    return T("усі") if v == "*" else (", ".join(v) if v else "-")
+
+
+# ---- clients ----------------------------------------------------------------
+def parse_sites(st, value):
+    if value in (None, ""):
+        return None
+    if value in ("*", "all", "усі"):
+        return "*"
+    if value in ("none", "-", "жодного"):
+        return []
+    names = [x.strip().lower() for x in value.split(",") if x.strip()]
+    for n in names:
+        get_site(st, n)
+    return names
+
+
+def used_octets(st):
+    used = {octet(c["ip"]) for c in st["clients"].values() if c["status"] != "revoked"}
+    with open(WG_CONF) as f:
+        for m in re.finditer(re.escape(NET) + r"(\d+)/32", base_conf(f.read())):
+            used.add(int(m.group(1)))
+    return used
+
+
+def cmd_add(a):
+    name = a.name
+    if not NAME_RE.match(name):
+        die(T("Ім'я: малі латинські літери, цифри і дефіс, до 31 символу"))
+    if a.hours is not None:
+        if not 1 <= a.hours <= GUEST_MAX_HOURS:
+            die(T("Гостьовий доступ: від 1 до {0} год", GUEST_MAX_HOURS))
+        if a.admin:
+            die(T("Гостьовому ключу не можна давати доступ до панелі"))
+    with Lock():
+        st = load()
+        old = st["clients"].get(name)
+        if old and old["status"] != "revoked":
+            die(T("Клієнт {0} вже існує ({1})", name, STATUS_UA[old['status']]))
+        if name in st["locations"]:
+            die(T("{0} зайняте локацією", name))
+        used = used_octets(st)
+        if a.ip:
+            if not IP_MIN <= a.ip <= IP_MAX or a.ip in used:
+                die(T("Адреса {0}{1} недоступна (вільні {2}-{3})", NET, a.ip, IP_MIN, IP_MAX))
+            n = a.ip
+        else:
+            free = [i for i in range(IP_MIN, IP_MAX + 1) if i not in used]
+            if not free:
+                die(T("Вільних адрес немає"))
+            n = free[0]
+        ip = f"{NET}{n}"
+        priv, pub, psk = genkeys()
+        sites = parse_sites(st, a.sites)
+        phone = clean_phone(a.phone)
+        if phone and not PHONE_RE.match(phone):
+            die(T("Телефон у міжнародному форматі, напр. +380671234567"))
+        guest = {}
+        if a.hours:
+            guest = dict(guest_until=now() + a.hours * 3600, guest_hours=a.hours, autorevoke=False, expires=None)
+        kw = dict(note=clean_note(a.note), expires=parse_date(a.expires), autorevoke=not a.no_autorevoke,
+                  admin=a.admin, sites=sites if sites is not None else [], conf=True, phone=phone, rotated=now())
+        kw.update(guest)
+        st["clients"][name] = new_client(ip, pub, psk, **kw)
+        write_file(f"{CONF_DIR}/{name}.conf", client_conf(priv, ip, psk))
+        save(st)
+        apply(st)
+    notify(T("Видано {0}доступ: {1} ({2})", T("гостьовий ") if a.hours else '', name, ip)
+           + (T(" на {0} год, до {1}", a.hours, fmt_ts(now() + a.hours * 3600)[11:]) if a.hours else ""), "access", name)
+    print(T("Клієнт {0} -> {1} створено. Сайти: {2}", name, ip, sites_str(st['clients'][name]['sites'])))
+    print(T("Конфіг: {0}/{1}.conf", CONF_DIR, name))
+    if a.qr:
+        qr(f"{CONF_DIR}/{name}.conf")
+    else:
+        print(T("На Mac:  scp vps:{0}/{1}.conf ~/Downloads/", CONF_DIR, name))
+
+
+def cmd_reissue(a):
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        if c["status"] == "revoked":
+            die(T("{0} відкликаний; видайте заново: wgctl add {1}", a.name, a.name))
+        priv, pub, psk = genkeys()
+        c.update(pubkey=pub, psk=psk, conf=True, online=False, suspect="", rotated=now(), rotate_warned=False)
+        write_file(f"{CONF_DIR}/{a.name}.conf", client_conf(priv, c["ip"], psk))
+        save(st)
+        apply(st, caddy=False)
+    notify(T("Перевидано конфіг: {0} ({1}); старий більше не працює", a.name, c['ip']), "access", a.name,
+           T("{0}: для пристрою «{1}» видано новий конфіг VPN. Старий більше не працює, отримайте новий в адміністратора.", BRAND, a.name))
+    print(T("Новий конфіг: {0}/{1}.conf (старий більше не працює)", CONF_DIR, a.name))
+    if a.qr:
+        qr(f"{CONF_DIR}/{a.name}.conf")
+
+
+def saved_conf(name):
+    st = load()
+    c = get_client(st, name)
+    path = f"{CONF_DIR}/{name}.conf"
+    if c["status"] == "revoked" or not os.path.exists(path):
+        die(T("Збереженого конфігу {0} немає. Перевидати: wgctl reissue {1}", name, name))
+    return path
+
+
+def cmd_conf(a):
+    with open(saved_conf(a.name)) as f:
+        sys.stdout.write(f.read())
+
+
+def cmd_qr(a):
+    out = qr(saved_conf(a.name), svg=a.svg)
+    if out:
+        sys.stdout.write(out)
+
+
+def cmd_list(a):
+    st = load()
+    peers = dump()
+    items = sorted(st["clients"].items(), key=lambda x: octet(x[1]["ip"]))
+    views = [client_view(n, c, peers, rotate_days(st)) for n, c in items if a.all or c["status"] != "revoked"]
+    if a.json:
+        print(json.dumps(views, ensure_ascii=False))
+        return
+    if not views:
+        print(T("Клієнтів немає. Додати: wgctl add <ім'я>"))
+        return
+    rows = [(T("ІМ'Я"), "IP", T("СТАТУС"), T("ЗВ'ЯЗОК"), T("ОСТАННЄ ПІДКЛ."), T("ЗВІДКИ"), T("ТРАФІК"), T("САЙТИ"), T("УВАГА"), T("ПРИМІТКА"))]
+    for v in views:
+        status = STATUS_UA[v["status"]] + (T(" (адмін)") if v["admin"] else "")
+        link = "-" if v["status"] == "revoked" else (T("онлайн") if v["online"] else T("офлайн"))
+        traffic = f"{human(v['rx'])}/{human(v['tx'])}" if v["rx"] or v["tx"] else "-"
+        warn = (T("підозра") if v["suspect"] else T("гість {0}", hm(v['guest_left'])) if v["guest"] else
+                T("< 7 дн") if v["autorevoke_in_days"] is not None and v["autorevoke_in_days"] <= WARN_DAYS else
+                T("змінити ключ") if v["rotate_due"] else "")
+        g = v["geo"]
+        where = " ".join(x for x in (g.get("cc", ""), g.get("city", "")) if x) or (g.get("ip") or "-")
+        rows.append((v["name"], v["ip"], status, link, ago(v["last_seen"]), where, traffic,
+                     sites_str(v["sites"]), warn, v["note"]))
+    table(rows)
+
+
+def cmd_show(a):
+    st = load()
+    v = client_view(a.name, get_client(st, a.name), dump(), rotate_days(st))
+    v["services"] = [{"name": n, "port": sv["port"], "target": f"{sv['target']}:{sv['target_port']}"}
+                     for n, sv in sorted(st.get("services", {}).items()) if a.name in sv.get("allow", [])]
+    if a.json:
+        print(json.dumps(v, ensure_ascii=False))
+        return
+    reason = f" ({REASON_UA.get(v['disabled_reason'], v['disabled_reason'])})" if v["disabled_reason"] else ""
+    print(T("Ім'я:             {0}{1}", v['name'], T("  [адмін]") if v['admin'] else ''))
+    print(T("Адреса:           {0}", v['ip']))
+    print(T("Статус:           {0}{1}", STATUS_UA[v['status']], reason))
+    print(T("Зв'язок:          {0}", T("онлайн") if v['online'] else T("офлайн")))
+    print(T("Останнє підкл.:   {0} ({1})", fmt_ts(v['last_seen']), ago(v['last_seen'])))
+    print(T("Звідки:           {0}", v['endpoint'] or '-'))
+    print(T("Трафік (з/до):    {0} / {1}", human(v['rx']), human(v['tx'])))
+    print(T("Сайти:            {0}", sites_str(v['sites'])))
+    print(T("Створено:         {0}", fmt_ts(v['created'])))
+    print(T("Термін дії:       {0}", v['expires'] or T("без обмеження")))
+    if v["status"] == "active":
+        print(T("Автовідкликання:  ") + (T("через {0} дн без підключень", v['autorevoke_in_days'])
+                                       if v["autorevoke"] else T("вимкнено")))
+    if v["guest"]:
+        print(T("Гостьовий доступ: до {0} (ще {1}), потім відкличеться", fmt_ts(v['guest_until']), hm(v['guest_left'])))
+    print(T("Ключ змінено:     {0} ({1} дн тому)", fmt_ts(v['rotated']), v['rotate_age'])
+          + (T("  ЧАС ЗМІНИТИ: wgctl reissue ") + v["name"] if v["rotate_due"] else ""))
+    print(T("Конфіг:           {0}", v['conf_file'] or T("не збережено (wgctl reissue)")))
+    if v["suspect"]:
+        print(T("Підозра:          {0} ({1})", v['suspect'], fmt_ts(v['suspect_at'])))
+    if v["revoked_at"]:
+        print(T("Відкликано:       {0}", fmt_ts(v['revoked_at'])))
+    print(T("Примітка:         {0}", v['note'] or '-'))
+    print(T("Телефон:          {0}", v['phone'] or '-'))
+    if v["notes"]:
+        print(T("Нотатки:          ") + v["notes"].replace("\n", "\n                  "))
+    if v["geo"]:
+        g = v["geo"]
+        marks = (T(" [хостинг/VPN]") if g.get("hosting") else "") + (" [Tor]" if g.get("tor") else "")
+        print(T("Місцезнаходження: {0}{1}", place(g), marks))
+        print(T("Довірені країни:  {0}", ', '.join(v['countries']) or '-'))
+    if v["endpoints"]:
+        print(T("Історія адрес:"))
+        for e in reversed(v["endpoints"][-8:]):
+            print(f"  {fmt_ts(e['ts'])}  {e['ip']:<16} {place(e)}")
+
+
+def change_status(name, status, reason, why, cat="access", user=None, icon=None):
+    with Lock():
+        st = load()
+        c = get_client(st, name)
+        if c["status"] == "revoked":
+            die(T("{0} уже відкликаний; видати заново: wgctl add {1}", name, name))
+        if c["status"] == status:
+            die(T("{0} уже {1}", name, STATUS_UA[status]))
+        c["status"], c["disabled_reason"] = status, reason
+        if status == "active":
+            c.update(warned=False, reactivated=now(), suspect="")
+        if status == "revoked":
+            c.update(revoked_at=now(), psk="", online=False, conf=False)
+            shred(f"{CONF_DIR}/{name}.conf")
+            for sv in st.get("services", {}).values():
+                if name in sv.get("allow", []):
+                    sv["allow"].remove(name)
+        save(st)
+        apply(st)
+    notify(f"{why}: {name} ({c['ip']})", cat, name, user, icon=icon)
+    print(f"{name}: {STATUS_UA[status]}")
+
+
+def cmd_disable(a):
+    sus = a.reason == "suspicious"
+    change_status(a.name, "disabled", a.reason,
+                  T("Заблоковано через підозрілу активність") if sus else T("Доступ вимкнено"),
+                  "security" if sus else "access",
+                  T("{0}: доступ пристрою «{1}» вимкнено адміністратором.", BRAND, a.name), "🚫" if sus else "⏸")
+
+
+def cmd_enable(a):
+    with Lock():
+        c = get_client(load(), a.name)
+    if c.get("expires") and c["expires"] < dt.datetime.now(TZ).date().isoformat():
+        die(T("Термін дії {0} минув {1}. Спершу: wgctl set {2} --expires РРРР-ММ-ДД|none", a.name, c['expires'], a.name))
+    change_status(a.name, "active", "", T("Доступ увімкнено"), "access",
+                  T("{0}: доступ пристрою «{1}» знову увімкнено.", BRAND, a.name), "▶️")
+
+
+def cmd_revoke(a):
+    if not a.yes:
+        ans = input(T("Відкликати {0} назавжди? Конфіг перестане працювати. [y/N] ", a.name))
+        if ans.strip().lower() not in ("y", "yes", "т", "так"):
+            die(T("Скасовано"))
+    change_status(a.name, "revoked", "", T("Доступ відкликано"), icon="🗑")
+
+
+def cmd_extend(a):
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        if c["status"] != "active":
+            die(T("{0} {1}; продовжувати можна лише активного", a.name, STATUS_UA[c['status']]))
+        if c.get("guest_until"):
+            hours = a.hours or 2
+            if not 1 <= hours <= GUEST_MAX_HOURS:
+                die(T("Від 1 до {0} год", GUEST_MAX_HOURS))
+            c["guest_until"] = max(now(), c["guest_until"]) + hours * 3600
+            if c["guest_until"] - now() > GUEST_MAX_HOURS * 3600:
+                die(T("Гостьовий доступ не довше {0} год наперед", GUEST_MAX_HOURS))
+            c["guest_hours"] = max(c.get("guest_hours", 0), (c["guest_until"] - now() + 3599) // 3600)
+            c["guest_warned"] = False
+            save(st)
+            msg = T("Продовжено гостьовий доступ: {0} до {1}", a.name, fmt_ts(c['guest_until'])[11:])
+            notify(msg, "access", a.name)
+            print(msg)
+            return
+        if a.hours:
+            die(T("--hours лише для гостьових ключів"))
+        c.update(reactivated=now(), warned=False)
+        save(st)
+    notify(T("Продовжено: {0}, відлік {1} дн почато заново", a.name, INACTIVE_DAYS), "access", a.name)
+    print(T("{0}: автовідкликання не раніше ніж через {1} дн", a.name, INACTIVE_DAYS))
+
+
+def set_config_value(section, key, value):
+    """Change one `key = "value"` line in config.toml, keeping comments and the rest of the file."""
+    with open(CONFIG_FILE) as f:
+        text = f.read()
+    line = f'{key} = "{value}"'
+    sec = re.search(rf"(?m)^\[{re.escape(section)}\]\s*$", text)
+    if not sec:
+        text = text.rstrip("\n") + f"\n\n[{section}]\n{line}\n"
+    else:
+        nxt = re.search(r"(?m)^\[", text[sec.end():])
+        end = sec.end() + (nxt.start() if nxt else len(text) - sec.end())
+        body = text[sec.end():end]
+        if re.search(rf"(?m)^{key}\s*=", body):
+            body = re.sub(rf"(?m)^{key}\s*=.*$", line, body, count=1)
+        else:
+            body = "\n" + line + body
+        text = text[:sec.end()] + body + text[end:]
+    write_file(CONFIG_FILE, text, 0o644)
+
+
+def cmd_config(a):
+    if a.language is not None:
+        set_config_value("general", "language", a.language)
+        log(f"EVENT:info language: {a.language}")
+    if a.rotate_days is not None:
+        if a.rotate_days not in (0, 30, 60, 90, 180, 365):
+            die(T("--rotate-days: 0, 30, 60, 90, 180 або 365"))
+        with Lock():
+            st = load()
+            st.setdefault("settings", {})["rotate_days"] = a.rotate_days
+            if a.rotate_days == 0:
+                for c in st["clients"].values():
+                    c["rotate_warned"] = False
+            save(st)
+        log(T("EVENT:info Нагадування про зміну ключів: {0}", T("вимкнено") if not a.rotate_days else T("кожні {0} дн", a.rotate_days)))
+    st = load()
+    cfg = {"rotate_days": rotate_days(st), "guest_max_hours": GUEST_MAX_HOURS,
+           "language": a.language or LANG, "languages": LANGUAGES}
+    if a.json:
+        print(json.dumps(cfg))
+    else:
+        rd = cfg["rotate_days"]
+        print(T("Нагадування змінити ключ: ") + (T("через {0} дн", rd) if rd else T("вимкнено")))
+
+
+def cmd_set(a):
+    msgs = []
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        given = False                     # the panel sends every field: only real changes go to the log
+        if a.note is not None:
+            given = True
+            if clean_note(a.note) != (c.get("note") or ""):
+                c["note"] = clean_note(a.note)
+                msgs.append(T("примітка"))
+        if a.expires is not None:
+            given = True
+            new = None if a.expires in ("", "none", "ні") else a.expires
+            if new != c.get("expires"):     # an unchanged (even past) date does not block saving
+                c["expires"] = parse_date(a.expires)
+                c["expiry_warned"] = False
+                msgs.append(T("термін дії: {0}", c['expires'] or T("без обмеження")))
+        if a.autorevoke is not None:
+            given = True
+            if onoff(a.autorevoke) != c.get("autorevoke", True):
+                c["autorevoke"] = onoff(a.autorevoke)
+                msgs.append(T("автовідкликання: {0}", T("так") if c['autorevoke'] else T("ні")))
+        if a.admin is not None:
+            if onoff(a.admin) and c.get("guest_until"):
+                die(T("Гостьовому ключу не можна давати доступ до панелі"))
+            c["admin"] = onoff(a.admin)
+            msgs.append(T("адмін: {0}", T("так") if c['admin'] else T("ні")))
+        if a.sites is not None:
+            c["sites"] = parse_sites(st, a.sites)
+            msgs.append(T("сайти: {0}", sites_str(c['sites'])))
+        if a.phone is not None:
+            given = True
+            ph = clean_phone(a.phone)
+            if ph in ("", "none"):
+                ph = ""
+            elif not PHONE_RE.match(ph):
+                die(T("Телефон у міжнародному форматі, напр. +380671234567, або none"))
+            if ph != (c.get("phone") or ""):
+                c["phone"] = ph
+                msgs.append(T("телефон: {0}", ph or '-'))
+        if a.notes is not None:
+            given = True
+            nt = a.notes.replace("\r\n", "\n")[:4000]
+            if nt != (c.get("notes") or ""):
+                c["notes"] = nt
+                msgs.append(T("нотатки"))
+        if not msgs:
+            if given or a.admin is not None or a.sites is not None:
+                print(T("{0}: без змін", a.name))
+                return
+            die(T("Нічого не змінено. Див. wgctl set -h"))
+        save(st)
+        apply(st, wg=False)
+    if a.admin is not None:
+        notify(T("{0} доступ до панелі: {1}", T("Надано") if c['admin'] else T("Забрано"), a.name), "security", a.name,
+               level="critical" if c["admin"] else "warning", icon="👑")
+    log(T("EVENT:info Змінено {0}: ", a.name) + "; ".join(msgs))
+    print(f"{a.name}: " + "; ".join(msgs))
+
+
+def cmd_grant(a, revoke=False):
+    with Lock():
+        st = load()
+        p = principal(st, a.who)
+        for s in a.sites:
+            get_site(st, s)
+        cur = p.get("sites") or []
+        if revoke:
+            if cur == "*":
+                die(T("У {0} доступ до всіх сайтів. Задайте список: wgctl set {1} --sites ...", a.who, a.who))
+            p["sites"] = [s for s in cur if s not in a.sites]
+        else:
+            if cur == "*":
+                die(T("У {0} уже доступ до всіх сайтів", a.who))
+            p["sites"] = sorted(set(cur) | set(a.sites))
+        save(st)
+        apply(st, wg=False)
+    what = T("Забрано доступ") if revoke else T("Надано доступ")
+    log(f"EVENT:info {what}: {a.who} -> {', '.join(a.sites)}")
+    print(T("{0}: сайти {1}", a.who, sites_str(p['sites'])))
+
+
+# ---- Cloudflare ------------------------------------------------------------
+def cf_api(method, path, body=None):
+    if os.environ.get("WGCTL_CF_FAKE"):
+        log(f"CF-FAKE {method} {path} {json.dumps(body, ensure_ascii=False) if body else ''}")
+        return {"success": True, "result": [] if method == "GET" else {"id": "fake-" + str(now())}}
+    token = caddy_env().get("CF_API_TOKEN")
+    if not token:
+        die(T("Немає токена Cloudflare у {0}", CADDY_ENV))
+    req = urllib.request.Request(CF_API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read()).get("errors", [])
+            msg = "; ".join(f"{x.get('code')}: {x.get('message')}" for x in err)
+        except Exception:
+            msg = str(e)
+        die(T("Cloudflare відповів помилкою: {0}", msg))
+    except Exception as e:
+        die(T("Немає зв'язку з Cloudflare: {0}", e))
+
+
+def cf_zone(st):
+    z = st.get("cloudflare", {}).get("zone")
+    if not z:
+        die(T("Не задано зону Cloudflare: wgctl cloudflare --zone <Zone ID> (Cloudflare -> домен -> Overview -> API)"))
+    return z
+
+
+def cf_publish(st, name):
+    """Proxied A record name.domain -> public IP of the VPS. Returns the record id."""
+    zone, fqdn = cf_zone(st), f"{name}.{DOMAIN}"
+    rec = {"type": "A", "name": fqdn, "content": PUBLIC_IP, "proxied": True, "ttl": 1,
+           "comment": T("wgctl: публічний сайт")}
+    found = cf_api("GET", f"/zones/{zone}/dns_records?type=A&name={fqdn}")["result"]
+    if found:
+        return cf_api("PATCH", f"/zones/{zone}/dns_records/{found[0]['id']}", rec)["result"]["id"]
+    return cf_api("POST", f"/zones/{zone}/dns_records", rec)["result"]["id"]
+
+
+def cf_unpublish(st, name, rec_id):
+    zone = cf_zone(st)
+    if rec_id and not rec_id.startswith("fake"):
+        cf_api("DELETE", f"/zones/{zone}/dns_records/{rec_id}")
+    else:
+        for r in cf_api("GET", f"/zones/{zone}/dns_records?type=A&name={name}.{DOMAIN}")["result"]:
+            cf_api("DELETE", f"/zones/{zone}/dns_records/{r['id']}")
+
+
+def cmd_cloudflare(a):
+    with Lock():
+        st = load()
+        if a.zone:
+            if not re.fullmatch(r"[0-9a-f]{32}", a.zone):
+                die(T("Zone ID: 32 символи 0-9a-f"))
+            st.setdefault("cloudflare", {})["zone"] = a.zone
+            save(st)
+    print(T("Зона Cloudflare: {0}", st.get('cloudflare', {}).get('zone') or T("не задано")))
+
+
+def set_public(st, name, on):
+    s = get_site(st, name)
+    if on and not s.get("public"):
+        s["cf_record"] = cf_publish(st, name)
+        s["public"] = True
+        return T("Сайт {0}.{1} тепер ПУБЛІЧНИЙ (через Cloudflare)", name, DOMAIN)
+    if not on and s.get("public"):
+        cf_unpublish(st, name, s.get("cf_record"))
+        s["public"], s["cf_record"] = False, ""
+        return T("Сайт {0}.{1} знову лише через VPN", name, DOMAIN)
+    return None
+
+
+# ---- sites ------------------------------------------------------------------
+def own_port_ok(port):
+    """Ports of the VPS itself that may be given to a site: not service ports (SSH, Caddy, its API, the panel) and not TCP services."""
+    return port >= 1024 and port not in (2019, 8090) and not TCP_PORTS[0] <= port <= TCP_PORTS[1]
+
+
+def norm_backend(b, st):
+    """Backend: only an IPv4 address in a location's network, a key's address or the VPS itself (on an allowed port).
+    Host names are not accepted: otherwise DNS or forms like 127.1 would bypass these checks."""
+    if not re.match(r"^https?://", b):
+        b = "http://" + b
+    m = re.fullmatch(r"(https?)://(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?/?", b)
+    if not m:
+        die(T("Бекенд у форматі http://192.168.1.20:80 або https://192.168.1.21:8006"))
+    port = int(m.group(3) or (443 if m.group(1) == "https" else 80))
+    if not 1 <= port <= 65535:
+        die(T("Порт бекенда: 1-65535"))
+    try:
+        ip = ipaddress.IPv4Address(m.group(2))
+    except ValueError:
+        die(T("Бекенд у форматі http://192.168.1.20:80 або https://192.168.1.21:8006"))
+    if ip.is_loopback or str(ip) in (HUB_IP, PUBLIC_IP):
+        if not own_port_ok(port):
+            # 2019 Caddy API, 8090 panel, <1024 SSH and Caddy itself, 2201-2999 TCP services: otherwise a site would bypass their filters
+            die(T("Порт {0} на самому VPS зайнятий службами (SSH, Caddy, панель) і не може бути сайтом", port))
+    elif site_host(st, {"backend": f"http://{ip}"})[0] not in ("location", "client"):
+        die(T("{0} не належить ні до мережі локації, ні до пристрою з ключем. Доступні: ", ip)
+            + ", ".join([n for l in st["locations"].values() for n in l.get("networks", [])] + [T("адреси ключів {0}X", NET)]))
+    return f"{m.group(1)}://{ip}" + (f":{m.group(3)}" if m.group(3) else "")
+
+
+def cmd_site_add(a):
+    name = a.name
+    if not NAME_RE.match(name) or name in RESERVED:
+        die(T("Ім'я сайту: малі латинські літери, цифри, дефіс; не {0}", ', '.join(sorted(RESERVED))))
+    with Lock():
+        st = load()
+        if name in st["sites"]:
+            die(T("Сайт {0} вже є", name))
+        if name in st.get("services", {}):
+            die(T("Ім'я {0} зайняте TCP-сервісом", name))
+        st["sites"][name] = {"backend": norm_backend(a.backend, st), "insecure": a.insecure,
+                             "upstream_host": a.upstream_host, "public": False,
+                             "note": clean_note(a.note), "created": now(), "health": {}}
+        save(st)
+        apply(st, wg=False)
+    notify(T("Додано сайт: {0}.{1} -> {2}", name, DOMAIN, st['sites'][name]['backend']), "access")
+    print(T("Сайт {0}.{1} додано. Доступ поки ні в кого: wgctl grant <клієнт> {2}", name, DOMAIN, name))
+
+
+def cmd_site_set(a):
+    with Lock():
+        st = load()
+        s = get_site(st, a.name)
+        if a.backend and a.backend.rstrip("/") != s["backend"]:       # an unchanged backend is not checked again
+            s["backend"] = norm_backend(a.backend, st)
+        if a.insecure is not None:
+            s["insecure"] = onoff(a.insecure)
+        if a.upstream_host is not None:
+            s["upstream_host"] = onoff(a.upstream_host)
+        if a.note is not None:
+            s["note"] = clean_note(a.note)
+        if a.log is not None:
+            s["log"] = a.log
+        if a.log_skip:
+            s["log_skip"] = parse_log_skip(a.log_skip)
+        msg = set_public(st, a.name, onoff(a.public)) if a.public is not None else None
+        save(st)
+        apply(st, wg=False)
+    if msg:
+        on = bool(st["sites"][a.name].get("public"))
+        notify(msg, "security", level="critical" if on else "warning", icon="🌍" if on else "🔒", link=f"/s/{a.name}")
+    else:
+        log(T("EVENT:info Змінено сайт {0}", a.name))
+    print(msg or T("Сайт {0} оновлено", a.name))
+
+
+def cmd_site_rm(a):
+    with Lock():
+        st = load()
+        if get_site(st, a.name).get("public"):
+            set_public(st, a.name, False)
+        del st["sites"][a.name]
+        for p in list(st["clients"].values()) + list(st["locations"].values()):
+            if isinstance(p.get("sites"), list) and a.name in p["sites"]:
+                p["sites"].remove(a.name)
+        save(st)
+        apply(st, wg=False)
+    notify(T("Видалено сайт: {0}.{1}", a.name, DOMAIN), "access")
+    print(T("Сайт {0} видалено", a.name))
+
+
+def site_host(st, s):
+    """Where a site's backend lives: ("location", name) | ("client", name) | ("vps", "") | ("other", address)."""
+    m = re.match(r"^https?://([^/:]+)", s.get("backend", ""))
+    host = m.group(1) if m else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return ("other", host)
+    if str(ip) in ("127.0.0.1", HUB_IP, PUBLIC_IP):
+        return ("vps", "")
+    for n, c in st["clients"].items():
+        if c["status"] != "revoked" and c.get("ip") == str(ip):
+            return ("client", n)
+    for n, l in st["locations"].items():
+        if l.get("ip") == str(ip):
+            return ("location", n)
+        for net in l.get("networks", []):
+            try:
+                if ip in ipaddress.ip_network(net, strict=False):
+                    return ("location", n)
+            except ValueError:
+                pass
+    return ("other", str(ip))
+
+
+def cmd_site_list(a):
+    st = load()
+    out = []
+    for name in sorted(st["sites"]):
+        s = st["sites"][name]
+        who = [n for n, c in st["clients"].items() if c["status"] != "revoked" and has_site(c, name)]
+        who += [n for n, l in st["locations"].items() if has_site(l, name)]
+        kind, where = site_host(st, s)
+        out.append({"name": name, "host": f"{name}.{DOMAIN}", **s, "access": sorted(who),
+                    "on_kind": kind, "on": where,
+                    "on_title": (st["locations"].get(where) or {}).get("title") or where if kind == "location" else ""})
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    if not out:
+        print(T("Сайтів немає. Додати: wgctl site add <ім'я> <бекенд>"))
+        return
+    rows = [(T("САЙТ"), T("БЕКЕНД"), T("СТАН"), T("ДОСТУП"), T("ПРИМІТКА"))]
+    for s in out:
+        h = s.get("health") or {}
+        state = "-" if not h else (T("ok {0} {1} мс", h.get('code'), h.get('ms')) if h.get("ok") else T("не відповідає"))
+        rows.append((s["host"] + (T(" [ПУБЛІЧНИЙ]") if s.get("public") else ""),
+                     s["backend"] + (" (insecure)" if s["insecure"] else ""),
+                     state, T("усі (публічний)") if s.get("public") else (", ".join(s["access"]) or "-"),
+                     s.get("note", "")))
+    table(rows)
+
+
+# ---- system state -----------------------------------------------------------
+def cert_expiry():
+    files = glob.glob(f"{CADDY_CERTS}/*/wildcard_.{DOMAIN}/wildcard_.{DOMAIN}.crt")
+    if not files or not shutil.which("openssl"):
+        return None
+    r = run(["openssl", "x509", "-enddate", "-noout", "-in", files[0]], check=False)
+    m = re.search(r"notAfter=(.+)", r.stdout)
+    if not m:
+        return None
+    return int(dt.datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z")
+               .replace(tzinfo=dt.timezone.utc).timestamp())
+
+
+def service_active(name):
+    if DRY:
+        return True
+    return run(["systemctl", "is-active", name], check=False).stdout.strip() == "active"
+
+
+def location_view(name, l, peers):
+    p = peers.get(l.get("pubkey", ""))
+    hs = p["hs"] if p else 0
+    age = now() - hs if hs else None
+    state = ("down" if age is None or age > LOCATION_DOWN_SEC else
+             "warn" if age > LOCATION_WARN_SEC else "ok")
+    return {"name": name, "note": l.get("note", ""), "title": l.get("title") or name, "state": state,
+            "handshake": hs, "endpoint": (p or {}).get("endpoint", ""), "ip": l.get("ip"),
+            "sites": l.get("sites", []), "networks": l.get("networks", []), "managed": bool(l.get("managed")),
+            "panel": bool(l.get("panel")), "has_conf": os.path.exists(f"{CONF_DIR}/location-{name}.conf")}
+
+
+def topology(st, peers):
+    """What lives where: sites by location, on client devices, on the VPS and elsewhere; device summary."""
+    t = now()
+    groups = {"location": {}, "client": {}, "vps": [], "other": []}
+    for name, s in sorted(st["sites"].items()):
+        kind, where = site_host(st, s)
+        h = s.get("health") or {}
+        item = {"name": name, "ok": h.get("ok"), "ms": h.get("ms"), "public": bool(s.get("public"))}
+        if kind in ("location", "client"):
+            groups[kind].setdefault(where, []).append(item)
+        else:
+            groups[kind].append(item)
+    for name, sv in sorted(st.get("services", {}).items()):
+        kind, where = site_host(st, {"backend": f"http://{sv['target']}"})
+        h = sv.get("health") or {}
+        item = {"name": name, "ok": h.get("ok"), "ms": h.get("ms"), "public": False, "svc": True, "port": sv["port"]}
+        if kind in ("location", "client"):
+            groups[kind].setdefault(where, []).append(item)
+    devices = []
+    for n, c in sorted(st["clients"].items(), key=lambda x: octet(x[1]["ip"])):
+        if c["status"] == "revoked":
+            continue
+        idle = (t - idle_from(c)) // 86400
+        state = ("bad" if c.get("suspect") or c.get("disabled_reason") == "suspicious" else
+                 "warn" if c["status"] == "active" and c.get("autorevoke", True) and INACTIVE_DAYS - idle <= WARN_DAYS else
+                 "off" if c["status"] == "disabled" else "ok" if c.get("online") else "idle")
+        hs = (peers.get(c["pubkey"]) or {}).get("hs", 0)
+        online = bool(hs) and t - hs < ONLINE_SEC
+        if state == "ok" and not online:
+            state = "idle"
+        elif state == "idle" and online:
+            state = "ok"
+        devices.append({"name": n, "state": state, "online": online,
+                        "sites": groups["client"].get(n, [])})
+    return {"locations": {n: groups["location"].get(n, []) for n in st["locations"]},
+            "vps": groups["vps"], "other": groups["other"], "devices": devices}
+
+
+def cmd_status(a):
+    st = load()
+    peers = dump()
+    exp = cert_expiry()
+    days = (exp - now()) // 86400 if exp else None
+    t = now()
+    out = {
+        "version": VERSION, "panel": st.get("panel", {}).get("enabled", False), "tcp_ready": tcp_ready(),
+        "panel_ips": panel_ips(st),
+        "wg0": "ok" if (DRY or peers is not None) else "down",
+        "caddy": "ok" if service_active("caddy") else "down",
+        "cert_expires": exp, "cert_days": days,
+        "locations": [location_view(n, l, peers) for n, l in st["locations"].items()],
+        "topology": topology(st, peers),
+        "clients": {k: sum(1 for c in st["clients"].values() if c["status"] == k)
+                    for k in ("active", "disabled", "revoked")},
+        "online": sum(1 for c in st["clients"].values() if c["status"] != "revoked"
+                      and t - (peers.get(c["pubkey"]) or {}).get("hs", 0) < ONLINE_SEC),
+        "suspects": [n for n, c in st["clients"].items() if c.get("suspect") and c["status"] != "revoked"],
+        "expiring": [n for n, c in st["clients"].items() if c["status"] == "active" and c.get("autorevoke", True)
+                     and not c.get("guest_until") and INACTIVE_DAYS - (now() - idle_from(c)) // 86400 <= WARN_DAYS],
+        "guests": [n for n, c in st["clients"].items() if c["status"] != "revoked" and c.get("guest_until")],
+        "rotate_due": [n for n, c in st["clients"].items() if c["status"] == "active" and not c.get("guest_until")
+                       and rotate_days(st) and (now() - c.get("rotated", c["created"])) // 86400 >= rotate_days(st)],
+    }
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    marks = {"ok": T("в нормі"), "warn": T("затримка"), "down": T("немає зв'язку")}
+    print(f"wgctl {VERSION}")
+    print(f"WireGuard wg0:    {out['wg0']}")
+    print(f"Caddy:            {out['caddy']}" + (T(", сертифікат ще {0} дн", days) if days is not None else ""))
+    for l in out["locations"]:
+        extra = f", handshake {ago(l['handshake'])}" if l.get("handshake") else ""
+        print(T("Локація {0:<9} {1}{2}", l['name'], marks[l['state']], extra))
+    c = out["clients"]
+    print(T("Клієнти:          активних {0}, вимкнених {1}, онлайн {2}", c['active'], c['disabled'], out['online']))
+    if out["suspects"]:
+        print(T("Підозрілі:        {0}", ', '.join(out['suspects'])))
+    if out["expiring"]:
+        print(T("Скоро відкликання: {0}", ', '.join(out['expiring'])))
+
+
+def cmd_panel(a):
+    with Lock():
+        st = load()
+        st.setdefault("panel", {"enabled": False, "port": 8090})["enabled"] = a.state == "on"
+        if a.state == "on" and not panel_ips(st):
+            die(T("Немає жодного активного адміна: wgctl set <ім'я> --admin on"))
+        save(st)
+        apply(st, wg=False)
+    notify(T("Вебпанель {0}", T("увімкнено") if a.state == 'on' else T("вимкнено")), "security", icon="🖥")
+    print(T("Панель {0}: {1}", PANEL_HOST, T("увімкнено") if a.state == 'on' else T("вимкнено")))
+
+
+# ---- geolocation ------------------------------------------------------------
+_GEO = {}
+
+
+def _db(name):
+    if name not in _GEO:
+        _GEO[name] = None
+        path = f"{GEO_DIR}/{name}.mmdb"
+        if os.path.exists(path):
+            try:
+                import maxminddb
+                _GEO[name] = maxminddb.open_database(path)
+            except ImportError:
+                log(T("geo: немає python3-maxminddb"))
+    return _GEO[name]
+
+
+def geo_lookup(ip):
+    """Country, city, coordinates, provider. Local databases only, no outside requests."""
+    if os.environ.get("WGCTL_GEO_FAKE"):
+        with open(os.environ["WGCTL_GEO_FAKE"]) as f:
+            g = json.load(f).get(ip, {})
+    else:
+        g = {}
+        city = _db("city")
+        r = city.get(ip) if city else None
+        if r:
+            g["cc"] = (r.get("country") or {}).get("iso_code", "")
+            g["country"] = ((r.get("country") or {}).get("names") or {}).get("en", "")
+            g["city"] = ((r.get("city") or {}).get("names") or {}).get("en", "")
+            loc = r.get("location") or {}
+            if "latitude" in loc:
+                g["lat"], g["lon"] = round(loc["latitude"], 3), round(loc["longitude"], 3)
+        asn = _db("asn")
+        r = asn.get(ip) if asn else None
+        if r:
+            g["asn"] = r.get("autonomous_system_number")
+            g["org"] = r.get("autonomous_system_organization", "")
+    org = (g.get("org") or "").lower()
+    g["hosting"] = any(w in org for w in HOSTING_WORDS)
+    tor = f"{GEO_DIR}/tor-exits.txt"
+    g["tor"] = bool(os.path.exists(tor) and ip in open(tor).read().split())
+    return g
+
+
+def place(e):
+    parts = [e.get("cc", ""), e.get("city", "")]
+    s = " ".join(x for x in parts if x) or T("невідомо")
+    return s + (f", {e['org']}" if e.get("org") else "")
+
+
+def km(a, b):
+    from math import asin, cos, radians, sin, sqrt
+    la1, lo1, la2, lo2 = map(radians, (a["lat"], a["lon"], b["lat"], b["lon"]))
+    h = sin((la2 - la1) / 2) ** 2 + cos(la1) * cos(la2) * sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371 * asin(sqrt(h))
+
+
+def flag(c, name, reason, events, user=None):
+    """Flag "candidate for blocking" + notification (at most once an hour for the same reason)."""
+    t = now()
+    if c.get("suspect") == reason and t - c.get("suspect_at", 0) < 3600:
+        return
+    c["suspect"], c["suspect_at"] = reason, t
+    events.append(ev(T("Підозра: {0}: {1}. Кандидат на блокування", name, reason), "security", name, user, icon="🕵️"))
+
+
+def geo_rules(name, c, entry, prev, events):
+    cc, org = entry.get("cc"), entry.get("org", "")
+    if entry.get("tor"):
+        flag(c, name, T("підключення через Tor ({0})", entry['ip']), events)
+    elif entry.get("hosting") and org not in c.get("trusted_orgs", []):
+        flag(c, name, T("адреса хостингу або VPN-сервісу: {0} ({1})", org, entry['ip']), events)
+    if cc:
+        seen = c.setdefault("countries", [])
+        if not seen:
+            seen.append(cc)                       # first connection = home country
+        elif cc not in seen:
+            flag(c, name, T("нова країна {0} ({1}), раніше: {2}", cc, place(entry), ', '.join(seen)), events,
+                 T("{0}: пристрій «{1}» підключився до VPN з незвичного місця ({2}). Якщо це не ви, негайно повідомте адміністратора.", BRAND, name, place(entry)))
+    if prev and "lat" in entry and "lat" in prev:
+        dist = km(prev, entry)
+        hours = max((entry["ts"] - prev["ts"]) / 3600, 1 / 60)
+        if entry.get("cc") != prev.get("cc") and dist >= TRAVEL_MIN_KM and dist / hours > TRAVEL_KMH:
+            flag(c, name, T("неможлива подорож: {0} -> {1}, {2} км за {3} хв", place(prev), place(entry), int(dist), int(hours * 60)), events,
+                 T("{0}: пристрій «{1}» підключився до VPN з незвичного місця ({2}). Якщо це не ви, негайно повідомте адміністратора.", BRAND, name, place(entry)))
+
+
+def cmd_trust(a):
+    """'It's me': the current country and provider become trusted, the flag is cleared."""
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        last = c["endpoints"][-1] if c["endpoints"] else {}
+        if last.get("cc") and last["cc"] not in c["countries"]:
+            c["countries"].append(last["cc"])
+        if last.get("org") and last.get("hosting") and last["org"] not in c["trusted_orgs"]:
+            c["trusted_orgs"].append(last["org"])
+        c["suspect"], c["suspect_at"] = "", 0
+        save(st)
+    notify(T("Позначено як довірене: {0} ({1})", a.name, place(last) if last else '-'), "security", a.name,
+           level="info", icon="🤝")
+    print(T("{0}: позначку знято; довірені країни {1}", a.name, ', '.join(c['countries']) or '-'))
+
+
+def cmd_clear(a):
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        c["suspect"], c["suspect_at"] = "", 0
+        save(st)
+    log(T("EVENT:info Позначку знято: {0}", a.name))
+    print(T("{0}: позначку знято", a.name))
+
+
+def fetch(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": f"Mozilla/5.0 (compatible; wgctl/{VERSION})"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def cmd_geo_update(a):
+    import gzip
+    os.makedirs(GEO_DIR, exist_ok=True)
+    today = dt.datetime.now(TZ).date()
+    months = [today.strftime("%Y-%m"), (today.replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m")]
+    for kind in ("city", "asn"):
+        for m in months:
+            url = f"https://download.db-ip.com/free/dbip-{kind}-lite-{m}.mmdb.gz"
+            try:
+                data = gzip.decompress(fetch(url, 120))
+            except Exception as e:
+                print(f"{kind} {m}: {e}")
+                continue
+            tmp = f"{GEO_DIR}/{kind}.mmdb.tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, f"{GEO_DIR}/{kind}.mmdb")
+            print(T("{0}: база DB-IP {1} ({2} МБ)", kind, m, len(data) // 1048576))
+            break
+        else:
+            print(T("{0}: не вдалося завантажити, лишається попередня база", kind))
+    try:
+        write_file(f"{GEO_DIR}/tor-exits.txt",
+                   fetch("https://check.torproject.org/torbulkexitlist", 60).decode(), 0o644)
+        print(T("tor: список вихідних вузлів оновлено"))
+    except Exception as e:
+        print(f"tor: {e}")
+    log(T("EVENT:info Оновлено геобази"))
+
+
+def cmd_geo_lookup(a):
+    g = geo_lookup(a.ip)
+    print(json.dumps(g, ensure_ascii=False) if a.json else
+          f"{a.ip}: {place(g)}" + (T(" [хостинг/VPN]") if g["hosting"] else "") + (" [Tor]" if g["tor"] else ""))
+
+
+# ---- monitor ----------------------------------------------------------------
+def probe(url):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    t0 = time.time()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=4, context=ctx)
+        code = r.status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    except Exception:
+        return {"ok": False, "code": None, "ms": None, "ts": now()}
+    return {"ok": True, "code": code, "ms": int((time.time() - t0) * 1000), "ts": now()}
+
+
+def cmd_monitor(a):
+    events, wg_changed, caddy_changed = [], False, False
+    with Lock():
+        st = load()
+        peers = dump()
+        t = now()
+        today = dt.datetime.now(TZ).date().isoformat()
+        for name, c in st["clients"].items():
+            if c["status"] == "revoked":
+                continue
+            p = peers.get(c["pubkey"])
+            hs = p["hs"] if p else 0
+            if hs > c.get("last_seen", 0):
+                c["last_seen"] = hs
+            ep = p["endpoint"] if p and p["endpoint"] not in ("(none)", "") else ""
+            if ep:
+                ip = ep.rsplit(":", 1)[0]
+                hist = c["endpoints"]
+                if not hist or hist[-1]["ip"] != ip:
+                    entry = {"ts": t, "ip": ip, **geo_lookup(ip)}
+                    prev = hist[-1] if hist else None
+                    hist.append(entry)
+                    del hist[:-50]
+                    geo_rules(name, c, entry, prev, events)
+                elif not hist[-1].get("cc"):          # the record appeared before the geo databases: fill it in
+                    g = geo_lookup(ip)
+                    if g.get("cc"):
+                        hist[-1].update(g)
+                        if not c["countries"]:
+                            c["countries"].append(g["cc"])
+                c["endpoint"] = ep
+                recent = [e for e in hist if e["ts"] >= t - FLAP_WINDOW]
+                switches = len(recent) - 1
+                if switches >= FLAP_COUNT and len({e["ip"] for e in recent}) >= 2:
+                    flag(c, name, T("подвійна активність, {0} зміни адреси за 10 хв ({1})", switches, ', '.join(sorted({e['ip'] for e in recent}))), events)
+            online = bool(hs) and t - hs < ONLINE_SEC
+            if online != c.get("online", False):
+                c["online"] = online
+                tag = T(" [вимкнений]") if c["status"] == "disabled" else ""
+                where = place(c["endpoints"][-1]) if c.get("endpoints") else c.get("endpoint", "").rsplit(":", 1)[0]
+                events.append(ev(T("Підключився: {0} ({1}){2}", name, where, tag) if online else T("Відключився: {0}{1}", name, tag),
+                                 "connect", name, icon="🟢" if online else "⚪"))
+            if c.get("guest_until"):
+                left = c["guest_until"] - t
+                if left <= 0:
+                    c.update(status="revoked", revoked_at=t, psk="", online=False, conf=False)
+                    shred(f"{CONF_DIR}/{name}.conf")
+                    wg_changed = caddy_changed = True
+                    events.append(ev(T("Гостьовий доступ завершився: {0}, ключ відкликано", name), "access", name, icon="⌛"))
+                    continue
+                if left <= GUEST_WARN_SEC and not c.get("guest_warned") and c["status"] == "active":
+                    c["guest_warned"] = True
+                    events.append(ev(T("Гостьовий доступ {0} закінчиться о {1}. Продовжити: панель або wgctl extend {2} --hours 2", name, fmt_ts(c['guest_until'])[11:], name), "warn", name, icon="⏳"))
+                continue                                     # guests do not need the other rules
+            if c["status"] != "active":
+                continue
+            rd = rotate_days(st)
+            if rd and not c.get("rotate_warned") and (t - c.get("rotated", c["created"])) // 86400 >= rd:
+                c["rotate_warned"] = True
+                events.append(ev(T("Час змінити ключ: {0} (не змінювався {1} дн). Перевидайте конфіг у панелі або wgctl reissue {2}", name, (t - c['rotated']) // 86400, name), "warn", name, icon="🔄"))
+            if c.get("expires") and c["expires"] < today:
+                c["status"], c["disabled_reason"] = "disabled", "expired"
+                caddy_changed = True
+                events.append(ev(T("Минув термін дії: {0} ({1}), доступ вимкнено", name, c['expires']), "access", name, level="warning", icon="⛔", user=
+                                 T("{0}: термін дії доступу пристрою «{1}» закінчився ({2}). Щоб поновити, зверніться до адміністратора.", BRAND, name, c['expires'])))
+                continue
+            if c.get("expires") and not c.get("expiry_warned"):
+                left = (dt.date.fromisoformat(c["expires"]) - dt.datetime.now(TZ).date()).days
+                if left <= EXPIRY_WARN_DAYS:
+                    c["expiry_warned"] = True
+                    events.append(ev(T("Скоро закінчиться термін дії: {0} (до {1}, {2} дн)", name, c['expires'], left), "warn",
+                                     name, icon="📅", user=T("{0}: доступ пристрою «{1}» діє до {2}. Щоб продовжити, зверніться до адміністратора.", BRAND, name, c['expires'])))
+            if not c.get("autorevoke", True):
+                continue
+            idle = (t - idle_from(c)) // 86400
+            if idle < INACTIVE_DAYS - WARN_DAYS:
+                c["warned"] = False
+            elif idle >= INACTIVE_DAYS and not c.get("admin"):
+                c.update(status="revoked", revoked_at=t, psk="", online=False, conf=False)
+                shred(f"{CONF_DIR}/{name}.conf")
+                wg_changed = caddy_changed = True
+                events.append(ev(T("Автоматично відкликано: {0} (не підключався {1} дн)", name, idle), "access", name, icon="🗑"))
+            elif not c.get("warned"):
+                c["warned"] = True
+                if idle >= INACTIVE_DAYS:
+                    events.append(ev(T("Адмін-клієнт {0} не підключався {1} дн. Продовжте (wgctl extend) або відкличте вручну", name, idle), "warn", name))
+                else:
+                    events.append(ev(T("Увага: {0} не підключався {1} дн, буде відкликаний через {2} дн", name, idle, INACTIVE_DAYS - idle), "warn", name, icon="⏳", user=
+                                     T("{0}: пристрій «{1}» не підключався до VPN {2} дн. Через {3} дн доступ буде автоматично відкликано. Щоб зберегти доступ, просто підключіться до VPN.", BRAND, name, idle, INACTIVE_DAYS - idle)))
+        for name, l in st["locations"].items():
+            v = location_view(name, l, peers)
+            prev = l.get("last_state", "ok")
+            if v["state"] == "down" and prev != "down":
+                events.append(ev(T("Локація {0}: немає зв'язку понад {1} хв", l.get("title") or name, LOCATION_DOWN_SEC // 60), "health",
+                                 level="critical", icon="📡", link="/"))
+            if v["state"] == "ok" and prev == "down":
+                events.append(ev(T("Локація {0}: зв'язок відновлено", l.get("title") or name), "health", level="info", icon="✅"))
+            l["last_state"] = v["state"]
+        if not os.environ.get("WGCTL_NO_PROBE"):
+            for name, sv in st.get("services", {}).items():
+                h = tcp_probe(sv["target"], sv["target_port"])
+                if sv.get("health") and sv["health"].get("ok") != h["ok"]:
+                    events.append(ev(T("Сервіс {0}: {1}", name, T("знову відповідає") if h['ok'] else T("ціль не відповідає")), "health",
+                                     level="info" if h["ok"] else "warning", icon="✅" if h["ok"] else "⚠️", link=f"/t/{name}"))
+                sv["health"] = h
+            for name, s in st["sites"].items():
+                h = probe(s["backend"])
+                if s.get("health") and s["health"].get("ok") != h["ok"]:
+                    events.append(ev(T("Сайт {0}: {1}", name, T("знову працює") if h['ok'] else T("бекенд не відповідає")), "health",
+                                     level="info" if h["ok"] else "warning", icon="✅" if h["ok"] else "⚠️", link=f"/s/{name}"))
+                s["health"] = h
+        save(st)
+        if wg_changed or caddy_changed:
+            apply(st, wg=wg_changed, caddy=caddy_changed)
+    notify_events(events)
+    try:
+        hist_record(st, peers, server_info(slow=False))
+    except Exception as ex:
+        log(f"history: {ex!r}")
+    try:
+        visits_ingest(st)
+    except Exception as ex:
+        log(f"visits: {ex!r}")
+    if now() // 60 % 10 == 0:                  # every 10 minutes: VPS health
+        try:
+            server_alerts(server_info())
+        except Exception as ex:
+            log(f"server check: {ex!r}")
+    flush_outbox()
+
+
+# ---- TCP services: SSH, RDP and so on through the hub ------------------------
+# A client connects to <hub>:<service port>, and systemd-socket-proxyd on the VPS connects it to the target.
+# Packet forwarding on the VPS stays off; nftables (chain wgctl_tcp) decides who may connect.
+TCP_DIR = f"{STATE_DIR}/tcp"
+TCP_NFT = P("/etc/nftables.d/wgctl-tcp.nft")
+NFT_CONF = P("/etc/nftables.conf")
+TCP_PORTS = (2201, 2999)                   # service ports on the hub
+PROXYD = "/usr/lib/systemd/systemd-socket-proxyd"
+TCP_PRESETS = {"ssh": 22, "rdp": 3389, "vnc": 5900}
+
+
+def tcp_units():
+    sock = (T("[Unit]\nDescription=wgctl TCP-сервіс на порту %i\n\n[Socket]\nListenStream={0}:%i\nFreeBind=true\nBacklog=64\n\n[Install]\nWantedBy=sockets.target\n", HUB_IP))
+    svc = (T("[Unit]\nDescription=wgctl TCP-сервіс на порту %i\nRequires=wgctl-tcp@%i.socket\nAfter=wgctl-tcp@%i.socket\n\n[Service]\nEnvironmentFile={0}/%i.env\nExecStart={1} --connections-max=32 ${{TARGET}}\nDynamicUser=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nSystemCallFilter=@system-service\nMemoryMax=64M\n", TCP_DIR, PROXYD))
+    return {P("/etc/systemd/system/wgctl-tcp@.socket"): sock, P("/etc/systemd/system/wgctl-tcp@.service"): svc}
+
+
+def tcp_ready():
+    """Whether the one-time setup is done: service templates and the jump to the wgctl_tcp chain in nftables.conf."""
+    try:
+        conf = open(NFT_CONF).read()
+    except OSError:
+        return False
+    return "jump wgctl_tcp" in conf and all(os.path.exists(p) for p in tcp_units())
+
+
+def nft_conf_patched(text):
+    """Adds the include of wgctl's file and the jump to the chain. Returns the new text or None if no place was found."""
+    if "jump wgctl_tcp" in text:
+        return text
+    inc = f'include "{TCP_NFT[len(ROOT):] if ROOT else TCP_NFT}"'
+    lines = text.splitlines()
+    out, inc_done, jump_done = [], False, False
+    for ln in lines:
+        if not inc_done and re.match(r"\s*table\s+inet\s+filter\s*\{", ln):
+            out += [T("# wgctl: TCP-сервіси (ланцюг wgctl_tcp; файл оновлює wgctl)"), inc, ""]
+            inc_done = True
+        out.append(ln)
+        if not jump_done and re.search(rf"udp dport {LISTEN_PORT} accept", ln):
+            ind = re.match(r"\s*", ln).group(0)
+            out.append(T("{0}jump wgctl_tcp        # wgctl: дозволені TCP-сервіси", ind))
+            jump_done = True
+    return "\n".join(out) + "\n" if inc_done and jump_done else None
+
+
+def render_tcp_nft(st):
+    lines = [T("# Згенеровано wgctl. Не редагуйте вручну: зміни зітруться."), "table inet filter {", "\tchain wgctl_tcp {"]
+    for name, sv in sorted(st.get("services", {}).items(), key=lambda x: x[1]["port"]):
+        ips = sorted({st["clients"][n]["ip"] for n in sv.get("allow", [])
+                      if n in st["clients"] and st["clients"][n]["status"] == "active"}, key=octet)
+        if ips:
+            lines.append(f'\t\tiifname "{IFACE}" ip saddr {{ {", ".join(ips)} }} tcp dport {sv["port"]} accept   # {name}')
+    lines += ["\t}", "}"]
+    return "\n".join(lines) + "\n"
+
+
+def apply_tcp(st, force=False):
+    """Updates nftables rules and services. Does nothing before the one-time `wgctl tcp setup`.
+    force: enable the sockets of all services (after a restore from backup)."""
+    if not tcp_ready():
+        return
+    new = render_tcp_nft(st)
+    old = open(TCP_NFT).read() if os.path.exists(TCP_NFT) else None
+    if new != old:
+        write_file(TCP_NFT, new, 0o644)
+        if not DRY:
+            body = new.split("\n", 1)[1]
+            r = run(["nft", "-f", "-"], f"flush chain inet filter wgctl_tcp\n{body}", check=False)
+            if r.returncode != 0:
+                if old is not None:
+                    write_file(TCP_NFT, old, 0o644)
+                die(T("nftables не прийняв правила TCP-сервісів: ") + r.stderr.strip())
+    os.makedirs(TCP_DIR, exist_ok=True)
+    want = {str(sv["port"]): f"TARGET={sv['target']}:{sv['target_port']}\n" for sv in st.get("services", {}).values()}
+    have = {f[:-4] for f in os.listdir(TCP_DIR) if f.endswith(".env")}
+    for port, env in want.items():
+        path = f"{TCP_DIR}/{port}.env"
+        changed = not os.path.exists(path) or open(path).read() != env
+        if changed:
+            write_file(path, env, 0o644)
+        if not DRY:
+            if port not in have or force:
+                run(["systemctl", "enable", "--now", f"wgctl-tcp@{port}.socket"], check=False)
+            elif changed:                                   # new target: restart the proxy
+                run(["systemctl", "stop", f"wgctl-tcp@{port}.service"], check=False)
+    for port in have - set(want):
+        if not DRY:
+            run(["systemctl", "disable", "--now", f"wgctl-tcp@{port}.socket"], check=False)
+            run(["systemctl", "stop", f"wgctl-tcp@{port}.service"], check=False)
+        os.remove(f"{TCP_DIR}/{port}.env")
+
+
+def svc_target_ok(st, ip):
+    """Target: an address in a location's network or an active client. The VPS itself and service addresses are refused."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        die(T("Ціль: IP-адреса, напр. 192.168.1.20"))
+    if a.version != 4 or a.is_loopback or a.is_link_local or a.is_multicast or a.is_unspecified or str(a) in (HUB_IP, PUBLIC_IP):
+        die(T("Ця адреса не може бути ціллю"))
+    kind, where = site_host(st, {"backend": f"http://{ip}"})
+    if kind in ("location", "client"):
+        return kind, where
+    die(T("{0} не належить ні до мережі локації, ні до пристрою з ключем. Доступні: ", ip)
+        + ", ".join([n for l in st["locations"].values() for n in l.get("networks", [])] + [T("адреси ключів {0}X", NET)]))
+
+
+def free_port(st):
+    used = {sv["port"] for sv in st.get("services", {}).values()}
+    for p in range(TCP_PORTS[0], TCP_PORTS[1] + 1):
+        if p not in used:
+            return p
+    die(T("Вільних портів немає"))
+
+
+def cmd_tcp_setup(a):
+    """One-time setup: service templates and a chain in nftables. Shows the changes and asks for confirmation."""
+    need_tty(T("Налаштування TCP-сервісів"))
+    if not DRY and not os.path.exists(PROXYD):
+        die(T("Не знайдено {0} (входить у systemd)", PROXYD))
+    text = open(NFT_CONF).read()
+    new = nft_conf_patched(text)
+    if new is None:
+        die(T("Не вдалося знайти в {0} місце для змін (рядки 'table inet filter' і 'udp dport 51820 accept'). Нічого не змінено.", NFT_CONF))
+    import difflib
+    if new != text:
+        print(T("Зміни в {0}:\n", NFT_CONF))
+        sys.stdout.writelines(difflib.unified_diff(text.splitlines(True), new.splitlines(True), T("було"), T("стане")))
+        print(T("\nЛанцюг wgctl_tcp спершу порожній: нові дозволи з'являться лише коли ви додасте сервіс і дасте доступ."))
+        if not a.yes and input(T("Застосувати? Напишіть так: ")).strip().lower() != T("так"):
+            die(T("Скасовано, нічого не змінено"))
+    st = load()
+    if not os.path.exists(TCP_NFT):
+        write_file(TCP_NFT, render_tcp_nft(st), 0o644)
+    if new != text:
+        if not DRY:
+            r = run(["nft", "-c", "-f", "-"], new, check=False)
+            if r.returncode != 0:
+                die(T("Перевірка nftables не пройшла, нічого не змінено: ") + r.stderr.strip())
+        shutil.copy2(NFT_CONF, NFT_CONF + ".before-wgctl-tcp")
+        write_file(NFT_CONF, new, 0o644)
+        if not DRY:
+            r = run(["nft", "-f", NFT_CONF], check=False)
+            if r.returncode != 0:
+                shutil.copy2(NFT_CONF + ".before-wgctl-tcp", NFT_CONF)
+                run(["nft", "-f", NFT_CONF], check=False)
+                die(T("nftables не прийняв нові правила, повернуто попередні: ") + r.stderr.strip())
+    for path, body in tcp_units().items():
+        write_file(path, body, 0o644)
+    if not DRY:
+        run(["systemctl", "daemon-reload"])
+    apply_tcp(st)
+    log(T("EVENT:security Налаштовано TCP-сервіси (ланцюг wgctl_tcp у nftables)"))
+    print(T("Готово. Копія попереднього файлу: {0}.before-wgctl-tcp\nДалі: wgctl tcp add <ім'я> <IP>:<порт>", NFT_CONF))
+
+
+def parse_target(v):
+    m = re.fullmatch(r"([\d.]+)(?::(\d{1,5}))?", v.strip())
+    if not m:
+        die(T("Ціль у форматі IP:порт, напр. 192.168.1.20:22"))
+    port = int(m.group(2) or 0)
+    if not 1 <= port <= 65535:
+        die(T("Вкажіть порт цілі 1-65535, напр. 192.168.1.20:22"))
+    return m.group(1), port
+
+
+def cmd_tcp_add(a):
+    name = a.name
+    if not NAME_RE.match(name) or name in RESERVED:
+        die(T("Ім'я: малі латинські літери, цифри, дефіс"))
+    ip, tport = parse_target(a.target)
+    with Lock():
+        st = load()
+        svcs = st.setdefault("services", {})
+        if name in svcs or name in st["sites"]:
+            die(T("Ім'я {0} вже зайняте сайтом або сервісом", name))
+        kind, where = svc_target_ok(st, ip)
+        port = a.port or free_port(st)
+        if not TCP_PORTS[0] <= port <= TCP_PORTS[1] or any(sv["port"] == port for sv in svcs.values()):
+            die(T("Порт хаба: вільний з {0}-{1}", TCP_PORTS[0], TCP_PORTS[1]))
+        svcs[name] = {"target": ip, "target_port": tport, "port": port, "note": clean_note(a.note),
+                      "allow": [], "created": now(), "health": {}}
+        save(st)
+        apply_tcp(st)
+    notify(T("Додано TCP-сервіс: {0} ({1}:{2} -> {3}:{4})", name, HUB_IP, port, ip, tport), "access")
+    print(T("Сервіс {0}: підключення {1}.{2}:{3} -> {4}:{5}. Доступ поки ні в кого: wgctl tcp allow {6} <ключ>", name, name, DOMAIN, port, ip, tport, name))
+    if not tcp_ready():
+        print(T("Увага: спершу виконайте разове налаштування: sudo wgctl tcp setup"))
+
+
+def cmd_tcp_set(a):
+    with Lock():
+        st = load()
+        sv = st.get("services", {}).get(a.name) or die(T("Сервісу {0} немає", a.name))
+        if a.target:
+            ip, tport = parse_target(a.target)
+            svc_target_ok(st, ip)
+            sv["target"], sv["target_port"], sv["health"] = ip, tport, {}
+        if a.note is not None:
+            sv["note"] = clean_note(a.note)
+        save(st)
+        apply_tcp(st)
+    log(T("EVENT:info Змінено TCP-сервіс {0}: {1}:{2}", a.name, sv['target'], sv['target_port']))
+    print(T("Сервіс {0} оновлено", a.name))
+
+
+def cmd_tcp_rm(a):
+    with Lock():
+        st = load()
+        if a.name not in st.get("services", {}):
+            die(T("Сервісу {0} немає", a.name))
+        del st["services"][a.name]
+        save(st)
+        apply_tcp(st)
+    notify(T("Видалено TCP-сервіс: {0}", a.name), "access")
+    print(T("Сервіс {0} видалено", a.name))
+
+
+def cmd_tcp_allow(a, deny=False):
+    with Lock():
+        st = load()
+        sv = st.get("services", {}).get(a.name) or die(T("Сервісу {0} немає", a.name))
+        for who in a.who:
+            c = st["clients"].get(who)
+            if not deny and (not c or c["status"] == "revoked"):
+                die(T("Ключа {0} немає", who))
+        cur = set(sv.get("allow", []))
+        sv["allow"] = sorted(cur - set(a.who) if deny else cur | set(a.who))
+        save(st)
+        apply_tcp(st)
+    log(T("EVENT:info {0} доступ до TCP-сервісу {1}: {2}", T("Забрано") if deny else T("Надано"), a.name, ', '.join(a.who)))
+    print(T("{0}: доступ мають {1}", a.name, ', '.join(sv['allow']) or T("ніхто")))
+
+
+def tcp_probe(ip, port):
+    import socket
+    t0 = time.time()
+    try:
+        with socket.create_connection((ip, port), timeout=3):
+            return {"ok": True, "ms": int((time.time() - t0) * 1000), "ts": now()}
+    except OSError:
+        return {"ok": False, "ms": None, "ts": now()}
+
+
+def services_view(st):
+    out = []
+    for name, sv in sorted(st.get("services", {}).items(), key=lambda x: x[1]["port"]):
+        kind, where = site_host(st, {"backend": f"http://{sv['target']}"})
+        allow = [n for n in sv.get("allow", []) if n in st["clients"] and st["clients"][n]["status"] != "revoked"]
+        out.append({"name": name, "host": f"{name}.{DOMAIN}", **sv, "allow": allow, "on_kind": kind, "on": where,
+                    "on_title": (st["locations"].get(where) or {}).get("title") or where if kind == "location" else "",
+                    "kind": next((k for k, p in TCP_PRESETS.items() if p == sv["target_port"]), "tcp")})
+    return out
+
+
+def cmd_tcp_list(a):
+    st = load()
+    out = services_view(st)
+    if a.json:
+        print(json.dumps({"ready": tcp_ready(), "services": out}, ensure_ascii=False))
+        return
+    if not tcp_ready():
+        print(T("Разове налаштування ще не виконано: sudo wgctl tcp setup"))
+    if not out:
+        print(T("Сервісів немає. Додати: wgctl tcp add notebook-ssh 192.168.1.20:22"))
+        return
+    rows = [(T("СЕРВІС"), T("ПІДКЛЮЧЕННЯ"), T("ЦІЛЬ"), T("СТАН"), T("ДОСТУП"))]
+    for s in out:
+        h = s.get("health") or {}
+        rows.append((s["name"], f"{s['host']}:{s['port']}", f"{s['target']}:{s['target_port']}",
+                     "-" if not h else (T("ok {0} мс", h['ms']) if h.get("ok") else T("не відповідає")), ", ".join(s["allow"]) or "-"))
+    table(rows)
+
+
+# ---- history (SQLite) -------------------------------------------------------
+# Per-minute values are kept for 2 days, hourly totals for 90 days; the panel charts read them.
+HISTORY_DB = P("/var/lib/wgctl/history.db")
+HIST_MINUTE_KEEP = 2 * 86400
+HIST_HOUR_KEEP = 90 * 86400
+
+
+def hist_db():
+    import sqlite3
+    os.makedirs(os.path.dirname(HISTORY_DB), exist_ok=True)
+    db = sqlite3.connect(HISTORY_DB, timeout=10)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript("""
+CREATE TABLE IF NOT EXISTS m (ts INTEGER NOT NULL, k TEXT NOT NULL, v REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS m_k_ts ON m(k, ts);
+CREATE TABLE IF NOT EXISTS h (ts INTEGER NOT NULL, k TEXT NOT NULL, avg REAL, min REAL, max REAL, sum REAL, n INTEGER,
+                              PRIMARY KEY (k, ts));
+CREATE TABLE IF NOT EXISTS last (k TEXT PRIMARY KEY, v REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+""")
+    return db
+
+
+def hist_record(st, peers, srv):
+    """One record per minute: key traffic and online state, location connectivity, sites, VPS load."""
+    t = now() // 60 * 60
+    rows = []
+    try:
+        db = hist_db()
+    except Exception as ex:
+        log(f"history: {ex!r}")
+        return
+    try:
+        last = dict(db.execute("SELECT k, v FROM last"))
+        newlast = {}
+        for name, c in st["clients"].items():
+            if c["status"] == "revoked":
+                continue
+            p = peers.get(c["pubkey"]) or {}
+            for d in ("rx", "tx"):
+                cur = p.get(d, 0)
+                prev = last.get(f"{d}:{name}")
+                newlast[f"{d}:{name}"] = cur
+                if prev is not None:
+                    rows.append((t, f"{d}:{name}", cur - prev if cur >= prev else cur))   # the counter was reset
+            rows.append((t, f"on:{name}", 1 if p.get("hs") and now() - p["hs"] < ONLINE_SEC else 0))
+        for name, l in st["locations"].items():
+            v = location_view(name, l, peers)["state"]
+            rows.append((t, f"loc:{name}", {"ok": 1, "warn": .5}.get(v, 0)))
+        for name, s in list(st["sites"].items()) + list(st.get("services", {}).items()):
+            h = s.get("health") or {}
+            if h:
+                rows.append((t, f"up:{name}", 1 if h.get("ok") else 0))
+                if h.get("ok") and h.get("ms") is not None:
+                    rows.append((t, f"ms:{name}", h["ms"]))
+        if srv:
+            rows += [(t, "load", srv["load"][0]), (t, "mem", srv["mem_pct"]), (t, "disk", srv["disk_pct"])]
+        with db:
+            db.execute("DELETE FROM m WHERE ts = ?", (t,))           # a second run within the same minute
+            db.executemany("INSERT INTO m (ts, k, v) VALUES (?, ?, ?)", rows)
+            db.executemany("INSERT OR REPLACE INTO last (k, v) VALUES (?, ?)", newlast.items())
+            hour = t // 3600 * 3600
+            done = int((db.execute("SELECT v FROM meta WHERE k='rolled'").fetchone() or ["0"])[0])
+            if done < hour - 3600:
+                db.execute("""INSERT OR REPLACE INTO h (ts, k, avg, min, max, sum, n)
+                              SELECT ts / 3600 * 3600, k, AVG(v), MIN(v), MAX(v), SUM(v), COUNT(*) FROM m
+                              WHERE ts >= ? AND ts < ? GROUP BY ts / 3600, k""", (max(done, t - HIST_MINUTE_KEEP), hour))
+                db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('rolled', ?)", (str(hour - 3600),))
+                db.execute("DELETE FROM m WHERE ts < ?", (t - HIST_MINUTE_KEEP,))
+                db.execute("DELETE FROM h WHERE ts < ?", (t - HIST_HOUR_KEEP,))
+    finally:
+        db.close()
+
+
+def hist_bytes():
+    """A consistent copy of the database for the archive (through the backup API, not by copying the file)."""
+    import sqlite3
+    if not os.path.exists(HISTORY_DB):
+        return None
+    src = sqlite3.connect(HISTORY_DB, timeout=10)
+    mem = sqlite3.connect(":memory:")
+    try:
+        src.backup(mem)
+        return mem.serialize()
+    finally:
+        src.close()
+        mem.close()
+
+
+# ---- site visit journal -----------------------------------------------------
+# Caddy writes its access log as JSON; every minute the monitor reads what is new and keeps only a daily summary:
+# who (key, location or country for public sites), which site, how many requests and refusals, first and last time.
+ACCESS_LOG = P("/var/log/caddy/wgctl-access.log")
+ACCESS_POS = P("/var/lib/wgctl/access.pos")
+VISITS_KEEP_DAYS = 90
+ACCESS_CHUNK = 8 * 1024 * 1024
+
+
+LOG_MODES = ("full", "hide-path", "off")
+LOG_SKIP_RE = re.compile(r"/[A-Za-z0-9._~/*-]{0,200}")
+
+
+def parse_log_skip(values):
+    """Paths a site does not write to the log (Caddy path matcher: /s, /health, /static/*).
+    Accepts several flags and comma-separated lists; none clears."""
+    out = []
+    for v in values:
+        for x in (y.strip() for y in v.split(",")):
+            if not x:
+                continue
+            if x == "none":
+                out = []
+                continue
+            if not LOG_SKIP_RE.fullmatch(x):
+                die(T("Шлях для --log-skip: починається з /, латиниця, цифри, . _ ~ - / і * (напр. /s або /static/*)"))
+            if x not in out:
+                out.append(x)
+    if len(out) > 20:
+        die(T("Не більше 20 шляхів у --log-skip"))
+    return out
+
+
+def site_log_lines(s, m, indent):
+    """A site's log inside the shared *.domain block (the VPN path)."""
+    t = "\t" * indent
+    mode, skip = s.get("log", "full"), s.get("log_skip") or []
+    if mode == "off":
+        return [f"{t}log_skip"]
+    out = [f"{t}log_name wgctl_hidden"] if mode == "hide-path" else []
+    if skip:
+        out += [f"{t}@nolog_{m} path {' '.join(skip)}", f"{t}log_skip @nolog_{m}"]
+    return out
+
+
+def caddy_log_lines(indent, mode="full", name=""):
+    """A site's access log. full: as is; hide-path: only the first path segment is logged
+    (/hook/<secret>?x=1 -> /hook/[hidden], / stays /), so secrets in the path and query never reach the file;
+    off: the site is not logged (and not counted in visits)."""
+    if mode == "off":
+        return []
+    t = "\t" * indent
+    path = ACCESS_LOG[len(ROOT):] if ROOT else ACCESS_LOG
+    fmt = [f"{t}\tformat json"]
+    if mode == "hide-path":
+        fmt = [f"{t}\tformat filter {{", f"{t}\t\twrap json", f"{t}\t\tfields {{",
+               f'{t}\t\t\trequest>uri regexp "^(/[^/?]*)[/?].*$" "$1/[hidden]"', f"{t}\t\t}}", f"{t}\t}}"]
+    return [f"{t}log {name + ' ' if name else ''}{{", f"{t}\toutput file {path} {{", f"{t}\t\troll_size 20MiB",
+            f"{t}\t\troll_keep 3", f"{t}\t}}"] + fmt + [f"{t}}}"]
+
+
+def visits_db():
+    db = hist_db()
+    db.executescript("""
+CREATE TABLE IF NOT EXISTS visits (day TEXT NOT NULL, site TEXT NOT NULL, who TEXT NOT NULL, n INTEGER NOT NULL,
+    denied INTEGER NOT NULL, bytes INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
+    PRIMARY KEY (day, site, who));
+CREATE INDEX IF NOT EXISTS visits_who ON visits(who, day);
+""")
+    return db
+
+
+def visits_ingest(st):
+    """Reads Caddy's log from where it stopped last time (handles rotation)."""
+    if not os.path.exists(ACCESS_LOG):
+        return 0
+    pos = read_json(ACCESS_POS, {})
+    stt = os.stat(ACCESS_LOG)
+    off = pos.get("off", 0) if pos.get("ino") == stt.st_ino and pos.get("off", 0) <= stt.st_size else 0
+    if off == stt.st_size:
+        return 0
+    with open(ACCESS_LOG, "rb") as f:
+        f.seek(off)
+        chunk = f.read(ACCESS_CHUNK)
+    cut = chunk.rfind(b"\n") + 1                    # complete lines only
+    if not cut:
+        return 0
+    by_ip = {c["ip"]: n for n, c in st["clients"].items() if c["status"] != "revoked"}
+    by_ip.update({l["ip"]: n for n, l in st["locations"].items() if l.get("ip")})
+    public = {n for n, s in st["sites"].items() if s.get("public")}
+    agg = {}
+    for ln in chunk[:cut].splitlines():
+        try:
+            r = json.loads(ln)
+            req = r["request"]
+            host = req.get("host", "").split(":")[0].lower()
+        except (ValueError, KeyError, AttributeError):
+            continue
+        if not host.endswith("." + DOMAIN) or host == PANEL_HOST:
+            continue
+        site = host[:-len(DOMAIN) - 1]
+        if site not in st["sites"]:
+            continue
+        ip = req.get("client_ip") or req.get("remote_ip", "")
+        if site in public:                        # behind Cloudflare: the real visitor address is in a header
+            hdr = (req.get("headers") or {}).get("Cf-Connecting-Ip") or []
+            real = hdr[0] if hdr else ip
+            who = "web:" + (geo_lookup(real).get("cc") or "??")
+        else:
+            who = by_ip.get(ip, ip)
+        ts = int(r.get("ts", now()))
+        day = dt.datetime.fromtimestamp(ts, TZ).date().isoformat()
+        a = agg.setdefault((day, site, who), [0, 0, 0, ts, ts])
+        a[0] += 1
+        a[1] += 1 if r.get("status") == 403 else 0
+        a[2] += int(r.get("size") or 0)
+        a[3], a[4] = min(a[3], ts), max(a[4], ts)
+    if agg:
+        db = visits_db()
+        try:
+            with db:
+                db.executemany("""INSERT INTO visits (day, site, who, n, denied, bytes, first, last) VALUES (?,?,?,?,?,?,?,?)
+                    ON CONFLICT(day, site, who) DO UPDATE SET n = n + excluded.n, denied = denied + excluded.denied,
+                    bytes = bytes + excluded.bytes, first = MIN(first, excluded.first), last = MAX(last, excluded.last)""",
+                               [(k[0], k[1], k[2], *v) for k, v in agg.items()])
+                keep = (dt.datetime.now(TZ).date() - dt.timedelta(days=VISITS_KEEP_DAYS)).isoformat()
+                db.execute("DELETE FROM visits WHERE day < ?", (keep,))
+        finally:
+            db.close()
+    write_file(ACCESS_POS, json.dumps({"ino": stt.st_ino, "off": off + cut}) + "\n", 0o600)
+    return sum(v[0] for v in agg.values())
+
+
+def cmd_visits(a):
+    since = (dt.datetime.now(TZ).date() - dt.timedelta(days=a.days - 1)).isoformat()
+    q = ("SELECT site, who, SUM(n), SUM(denied), SUM(bytes), MIN(first), MAX(last), COUNT(DISTINCT day) FROM visits "
+         "WHERE day >= ?")
+    args = [since]
+    if a.site:
+        q += " AND site = ?"
+        args.append(a.site)
+    if a.client:
+        q += " AND who = ?"
+        args.append(a.client)
+    q += " GROUP BY site, who ORDER BY MAX(last) DESC LIMIT 200"
+    rows = []
+    if os.path.exists(HISTORY_DB):
+        db = visits_db()
+        try:
+            rows = [dict(zip(("site", "who", "n", "denied", "bytes", "first", "last", "days"), r))
+                    for r in db.execute(q, args)]
+            st = load()
+            for r in rows:                                   # who it is: a key, a location, the internet or an unknown address
+                w = r["who"]
+                r["who_kind"] = ("web" if w.startswith("web:") else "client" if w in st["clients"] else
+                                 "location" if w in st["locations"] else "ip")
+                if r["who_kind"] == "location":
+                    r["who_title"] = st["locations"][w].get("title") or w
+        finally:
+            db.close()
+    if a.json:
+        print(json.dumps({"days": a.days, "logging": os.path.exists(ACCESS_LOG), "rows": rows}, ensure_ascii=False))
+        return
+    if not rows:
+        print(T("Відвідувань за цей час немає") + ("" if os.path.exists(ACCESS_LOG) else T(" (журнал Caddy ще не створено: wgctl render)")))
+        return
+    table([(T("САЙТ"), T("ХТО"), T("ЗАПИТІВ"), T("ВІДМОВ"), T("ДНІВ"), T("ВОСТАННЄ"))] +
+          [(r["site"], r["who"], r["n"], r["denied"], r["days"], fmt_ts(r["last"])) for r in rows])
+
+
+# ---- history for charts -----------------------------------------------------
+RANGES = {"24h": (86400, 600), "7d": (7 * 86400, 3600), "30d": (30 * 86400, 6 * 3600), "90d": (90 * 86400, 86400)}
+
+
+def is_counter(k):
+    return k.startswith(("rx:", "tx:"))
+
+
+def history(keys, rng):
+    """{key: [[segment start, value], ...]}: counters are summed, the rest is averaged."""
+    span, step = RANGES[rng]
+    t = now()
+    since = (t - span) // step * step
+    out = {k: {} for k in keys}
+    if not os.path.exists(HISTORY_DB):
+        return {"range": rng, "step": step, "from": since, "to": t, "series": {k: [] for k in keys}}
+    db = hist_db()
+    try:
+        for k in keys:
+            agg = "SUM" if is_counter(k) else "AVG"
+            if rng == "24h":
+                rows = db.execute(f"SELECT ts / ? * ?, {agg}(v) FROM m WHERE k = ? AND ts >= ? GROUP BY ts / ?",
+                                  (step, step, k, since, step)).fetchall()
+            else:
+                col = "sum" if is_counter(k) else "avg"
+                last_h = db.execute("SELECT MAX(ts) FROM h WHERE k = ?", (k,)).fetchone()[0] or 0
+                hours = db.execute(f"SELECT ts, {col}, n FROM h WHERE k = ? AND ts >= ?", (k, since)).fetchall()
+                hours += db.execute(f"SELECT ts / 3600 * 3600, {agg}(v), COUNT(*) FROM m WHERE k = ? AND ts >= ? "
+                                    "GROUP BY ts / 3600", (k, max(since, last_h + 3600))).fetchall()
+                buckets = {}
+                for ts, v, n in hours:
+                    b = buckets.setdefault(ts // step * step, [0.0, 0])
+                    if is_counter(k):
+                        b[0] += v
+                        b[1] = 1
+                    else:
+                        b[0] += v * n
+                        b[1] += n
+                rows = [(b, s / max(n, 1)) for b, (s, n) in buckets.items()]
+            out[k] = {int(b): round(v, 3) for b, v in rows if v is not None}
+    finally:
+        db.close()
+    return {"range": rng, "step": step, "from": since, "to": t,
+            "series": {k: sorted([b, v] for b, v in out[k].items()) for k in keys}}
+
+
+def cmd_history(a):
+    keys = [k for k in a.keys.split(",") if re.fullmatch(r"[a-z]+(:[a-z0-9-]+)?", k)]
+    print(json.dumps(history(keys, a.range)))
+
+
+# ---- VPS state --------------------------------------------------------------
+SERVER_CACHE = P("/var/lib/wgctl/server.json")
+ALERTS = P("/var/lib/wgctl/alerts.json")
+SERVICES = [f"wg-quick@{IFACE}", "caddy", "vpnadmin", "nftables", "ssh"]
+TIMERS = ["wgctl-monitor", "wgctl-geo", "wgctl-report", "wgctl-backup"]
+DISK_WARN, DISK_BAD = 85, 95
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def apt_updates(cache):
+    """(all, security) updates. apt-check is slow, so it is cached for 6 hours."""
+    try:
+        dpkg_changed = os.path.getmtime("/var/lib/dpkg/status") > cache.get("apt_ts", 0)
+    except OSError:
+        dpkg_changed = False
+    if cache.get("apt_ts", 0) > now() - 6 * 3600 and "apt" in cache and not dpkg_changed:
+        return cache["apt"]
+    res = None
+    if DRY:
+        res = [int(x) for x in os.environ.get("WGCTL_FAKE_APT", "3;1").split(";")]
+    elif os.path.exists("/usr/lib/update-notifier/apt-check"):
+        r = subprocess.run(["/usr/lib/update-notifier/apt-check"], capture_output=True, text=True, timeout=120)
+        m = re.match(r"^(\d+);(\d+)", r.stderr.strip())
+        if m:
+            res = [int(m.group(1)), int(m.group(2))]
+    if res is None:
+        r = subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True, timeout=120)
+        lines = [ln for ln in r.stdout.splitlines() if "/" in ln]
+        res = [len(lines), sum(1 for ln in lines if "-security" in ln)]
+    cache["apt"], cache["apt_ts"] = res, now()
+    return res
+
+
+def release_check(cache):
+    """Latest release on GitHub via `wgctl-update --check`, at most once a day. Returns the newer version or ""."""
+    if cache.get("rel_ts", 0) > now() - 86400 and "rel" in cache:
+        return cache["rel"]
+    if os.environ.get("SUDO_USER") == PANEL_USER:      # the panel never waits for GitHub: the monitor refreshes it
+        return cache.get("rel", "")
+    tool = shutil.which("wgctl-update", path=f"/usr/local/sbin:{os.environ.get('PATH', '')}")
+    if DRY:
+        res = os.environ.get("WGCTL_FAKE_RELEASE", "")
+    elif not tool:
+        return ""
+    else:
+        try:
+            r = subprocess.run([tool, "--check"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return cache.get("rel", "")
+        m = re.search(r"-> (\d+(?:\.\d+)+)", r.stdout) if r.returncode == 10 else None
+        if r.returncode not in (0, 10):
+            return cache.get("rel", "")
+        res = m.group(1) if m else ""
+    cache["rel"], cache["rel_ts"] = res, now()
+    return res
+
+
+def systemd_units():
+    if DRY:
+        svc = {s: "active" for s in SERVICES}
+        tim = {t: {"active": "active", "last": now() - 60, "next": now() + 60} for t in TIMERS}
+        return svc, tim
+    r = run(["systemctl", "is-active"] + SERVICES, check=False)
+    svc = dict(zip(SERVICES, (r.stdout.split() + ["unknown"] * len(SERVICES))[:len(SERVICES)]))
+    tim = {}
+    r = run(["systemctl", "show", "--timestamp=unix", "-p", "Id,ActiveState,LastTriggerUSec,NextElapseUSecRealtime"]
+            + [f"{t}.timer" for t in TIMERS], check=False)
+    for block in r.stdout.strip().split("\n\n"):
+        kv = dict(ln.split("=", 1) for ln in block.splitlines() if "=" in ln)
+        name = kv.get("Id", "").removesuffix(".timer")
+        if name in TIMERS:
+            tim[name] = {"active": kv.get("ActiveState", ""), "last": systemd_ts(kv.get("LastTriggerUSec")),
+                         "next": systemd_ts(kv.get("NextElapseUSecRealtime"))}
+    return svc, tim
+
+
+def systemd_ts(v):
+    """'@1793210000' (systemctl --timestamp=unix) -> unix time; 'n/a' -> 0."""
+    m = re.search(r"@(\d+)", v or "")
+    return int(m.group(1)) if m else 0
+
+
+def server_info(slow=True):
+    """State of the VPS itself. slow=False: without apt (for the per-minute monitor)."""
+    cache = read_json(SERVER_CACHE, {})
+    mem = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                k, v = ln.split(":", 1)
+                mem[k] = int(v.split()[0]) * 1024
+    except OSError:
+        pass
+    du = shutil.disk_usage(ROOT or "/")
+    try:
+        with open("/proc/uptime") as f:
+            up = int(float(f.read().split()[0]))
+    except OSError:
+        up = 0
+    total, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+    rr = P("/var/run/reboot-required")
+    reboot = os.path.exists(rr)
+    pkgs = []
+    if reboot and os.path.exists(rr + ".pkgs"):
+        with open(rr + ".pkgs") as f:
+            pkgs = sorted(set(f.read().split()))
+    unattended = False
+    try:
+        with open(P("/etc/apt/apt.conf.d/20auto-upgrades")) as f:
+            unattended = bool(re.search(r'Unattended-Upgrade\s+"1"', f.read()))
+    except OSError:
+        pass
+    os_name = ""
+    try:
+        with open("/etc/os-release") as f:
+            os_name = dict(ln.rstrip().split("=", 1) for ln in f if "=" in ln).get("PRETTY_NAME", "").strip('"')
+    except OSError:
+        pass
+    info = {
+        "ts": now(), "host": os.uname().nodename, "os": os_name, "kernel": os.uname().release,
+        "uptime": up, "load": [round(x, 2) for x in os.getloadavg()], "cpus": os.cpu_count() or 1,
+        "mem_total": total, "mem_used": total - avail, "mem_pct": round((total - avail) * 100 / total, 1) if total else 0,
+        "disk_total": du.total, "disk_used": du.used, "disk_pct": round(du.used * 100 / du.total, 1) if du.total else 0,
+        "reboot": reboot, "reboot_since": int(os.path.getmtime(rr)) if reboot else 0, "reboot_pkgs": pkgs,
+        "unattended": unattended,
+    }
+    if slow:
+        try:
+            info["updates"], info["security"] = apt_updates(cache)
+        except Exception as ex:
+            info["updates"] = info["security"] = None
+            log(f"apt: {ex!r}")
+        info["services"], info["timers"] = systemd_units()
+        exp = cert_expiry()
+        info["cert_days"] = (exp - now()) // 86400 if exp else None
+        info["backup"] = backup_status()
+        info["release"] = release_check(cache)
+        write_file(SERVER_CACHE, json.dumps({k: cache[k] for k in ("apt", "apt_ts", "rel", "rel_ts") if k in cache}) + "\n", 0o644)
+    return info
+
+
+def server_checks(info):
+    """Problems worth a notification: [(key, level, text)]."""
+    out = []
+    if info["disk_pct"] >= DISK_WARN:
+        out.append(("disk", "bad" if info["disk_pct"] >= DISK_BAD else "warn",
+                    T("Диск VPS заповнений на {0:.0f}% (вільно {1})", info['disk_pct'], human(info['disk_total'] - info['disk_used']))))
+    if info["reboot"] and now() - info["reboot_since"] > 7 * 86400:
+        out.append(("reboot", "warn", T("VPS чекає перезавантаження вже {0} дн (оновлено: {1})", (now() - info['reboot_since']) // 86400, ', '.join(info['reboot_pkgs'][:4]) or T("ядро"))))
+    if info.get("security") and not info.get("unattended"):
+        out.append(("security", "warn", T("Оновлень безпеки: {0}, автоматичні оновлення вимкнено", info['security'])))
+    for s, v in (info.get("services") or {}).items():
+        if v != "active":
+            out.append((f"svc:{s}", "bad", T("Служба {0} не працює ({1})", s, v)))
+    b = info.get("backup") or {}
+    if b.get("configured"):
+        if b.get("last_error"):
+            out.append(("backup", "bad", T("Резервна копія не створилась: {0}", b['last_error'])))
+        elif now() - (b.get("last_ok") or 0) > 36 * 3600:
+            out.append(("backup", "warn", T("Резервної копії не було понад 36 год")))
+    if info.get("release"):
+        out.append((f"release:{info['release']}", "info", T("Доступна нова версія wgctl {0} (зараз {1}): sudo wgctl-update", info["release"], VERSION)))
+    if info.get("cert_days") is not None and info["cert_days"] <= 14:
+        out.append(("cert", "warn", T("Сертифікат *.{0} закінчиться через {1} дн", DOMAIN, info['cert_days'])))
+    return out
+
+
+def server_alerts(info):
+    """Notifies only about changes: a new problem, a problem gone."""
+    seen = read_json(ALERTS, {})
+    cur = {k: (lvl, text) for k, lvl, text in server_checks(info)}
+    for k, (lvl, text) in cur.items():
+        if seen.get(k) != lvl:
+            notify(text, "health", level={"bad": "critical", "warn": "warning"}.get(lvl, "info"),
+                   icon={"disk": "💽", "reboot": "🔁", "security": "🩹", "backup": "💾", "cert": "🔐"}.get(k, "⬆️" if k.startswith("release:") else "🖥"),
+                   link="/server")
+    for k in seen:
+        if k not in cur and not k.startswith("release:"):
+            notify(T("VPS: в нормі ({0})", {'disk': T("місце на диску"), 'reboot': T("перезавантаження"), 'security': T("оновлення"), 'backup': T("резервні копії"), 'cert': T("сертифікат")}.get(k, k.split(':', 1)[-1])), "health", level="info", icon="✅")
+    write_file(ALERTS, json.dumps({k: v[0] for k, v in cur.items()}) + "\n", 0o644)
+
+
+def cmd_server(a):
+    info = server_info()
+    info["issues"] = [{"key": k, "level": lvl, "text": t} for k, lvl, t in server_checks(info)]
+    if a.json:
+        print(json.dumps(info, ensure_ascii=False))
+        return
+    print(T("{0}: {1}, ядро {2}, працює {3} дн", info['host'], info['os'], info['kernel'], info['uptime'] // 86400))
+    print(T("Навантаження: {0} ({1} ядер)", ' '.join(map(str, info['load'])), info['cpus']))
+    print(T("Пам'ять:      {0} з {1} ({2}%)", human(info['mem_used']), human(info['mem_total']), info['mem_pct']))
+    print(T("Диск:         {0} з {1} ({2}%)", human(info['disk_used']), human(info['disk_total']), info['disk_pct']))
+    print(T("Оновлення:    {0}, з них безпеки {1}; автооновлення {2}", info['updates'], info['security'], T("так") if info['unattended'] else T("ні")))
+    print(T("Перезавантаження: {0}", T("потрібне") if info['reboot'] else T("не потрібне")))
+    print(T("Служби:       ") + ", ".join(f"{k} {v}" for k, v in info["services"].items()))
+    b = info["backup"]
+    print(T("Резервні копії: {0}, остання {1}", len(b['files']), fmt_ts(b['last_ok'])) if b["configured"] else
+          T("Резервні копії: не налаштовано (wgctl backup init)"))
+    for i in info["issues"]:
+        print(f"  ! {i['text']}")
+
+
+# ---- backups ----------------------------------------------------------------
+BACKUP_OUT = P("/var/backups/wgctl")
+BACKUP_KEEP = 14
+BACKUP_PUB = f"{STATE_DIR}/backup-recipient.txt"
+BACKUP_STATE = P("/var/lib/wgctl/backup.json")
+SIGNAL_OUT = f"{SIGNAL_DIR}/outgoing"
+BACKUP_SIGNAL_DAYS = 7          # even without changes a copy goes to Signal once a week
+BACKUP_PATHS = [
+    "/etc/wgctl", "/etc/wireguard", "/etc/caddy", "/etc/vpnadmin", "/etc/nftables.conf", "/etc/nftables.d",
+    "/etc/sudoers.d/vpnadmin", "/etc/ssh/sshd_config.d", "/etc/systemd/system/vpnadmin.service",
+    "/etc/systemd/system/wgctl-*", "/usr/local/sbin/wgctl", "/usr/local/sbin/vpnadmin", "/usr/local/sbin/wgctl-update",
+    "/var/lib/wgctl", "/var/lib/signal-cli", "/var/log/wgctl.log",
+]
+# not needed or rebuilt by itself: geo databases, queue, cache; the history database goes separately (consistent copy)
+BACKUP_SKIP = re.compile(r"^/var/lib/wgctl/(geoip|stub)(/|$)|^/var/lib/wgctl/(outbox|server|alerts)\.json$|^/var/lib/wgctl/access\.pos$|"
+                         r"^/var/lib/wgctl/history\.db|^/var/lib/signal-cli/(attachments|avatars|stickers|outgoing)(/|$)")
+# for the "configuration changed" fingerprint, ignore what changes by itself
+VOLATILE = re.compile(r"^/var/lib/|^/var/log/|^/etc/wgctl/backup/|\.backup$")
+CLIENT_KEYS = ("ip", "pubkey", "psk", "status", "disabled_reason", "sites", "admin", "note", "notes", "phone",
+               "expires", "autorevoke", "conf", "created", "guest_until", "rotated")
+
+
+def age_bin():
+    return shutil.which("age")
+
+
+def owner_names(stt):
+    import grp
+    import pwd
+    try:
+        u = pwd.getpwuid(stt.st_uid).pw_name
+    except KeyError:
+        u = "root"
+    try:
+        g = grp.getgrgid(stt.st_gid).gr_name
+    except KeyError:
+        g = "root"
+    return u, g
+
+
+# Owners for backups made before the archive started to store owner names
+DEFAULT_OWNERS = (("etc/vpnadmin/", "vpnadmin"), ("var/lib/signal-cli/", "signal"))
+
+
+def restorable(name):
+    """Only what goes into a backup can be restored: otherwise a forged archive could write anything as root."""
+    path = "/" + name
+    for pat in BACKUP_PATHS:
+        if path == pat or path.startswith(pat.rstrip("/") + "/") or ("*" in pat and fnmatch.fnmatchcase(path, pat)):
+            return not BACKUP_SKIP.search(path) or path == "/var/lib/wgctl/history.db"
+    return False
+
+
+def restore_owner(name, ti):
+    """(uid, gid) for a restored file: from the archive, or the default for old backups; unknown names -> root."""
+    import grp
+    import pwd
+    user, group = ti.uname or "", ti.gname or ""
+    if not user:
+        user = group = next((u for pre, u in DEFAULT_OWNERS if name.startswith(pre)), "root")
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        uid = 0
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        gid = 0
+    return uid, gid
+
+
+def makedirs_owned(path, uid, gid):
+    """Like os.makedirs, but new directories get the file's owner (e.g. signal-cli data) and mode 0700."""
+    missing = []
+    while path and not os.path.isdir(path):
+        missing.append(path)
+        path = os.path.dirname(path)
+    for d in reversed(missing):
+        os.mkdir(d, 0o700)
+        if os.geteuid() == 0:
+            os.chown(d, uid, gid, follow_symlinks=False)
+
+
+def backup_files():
+    """Paths for the archive: (path on disk, name in the archive)."""
+    out = []
+    for pat in BACKUP_PATHS:
+        for path in sorted(glob.glob(P(pat))):
+            for root, dirs, files in (os.walk(path) if os.path.isdir(path) else [(os.path.dirname(path), [], [os.path.basename(path)])]):
+                dirs.sort()
+                for fn in sorted(files):
+                    full = os.path.join(root, fn)
+                    arc = full[len(ROOT):] if ROOT and full.startswith(ROOT) else full
+                    if BACKUP_SKIP.search(arc) or os.path.islink(full) or not os.path.isfile(full):
+                        continue
+                    out.append((full, arc))
+    return out
+
+
+def norm_for_fingerprint(arc, data):
+    """What counts as a configuration change: key state without live counters, auth without the TOTP counter."""
+    if arc.endswith("/etc/wgctl/state.json"):
+        st = json.loads(data)
+        st["clients"] = {n: {k: c.get(k) for k in CLIENT_KEYS} for n, c in st.get("clients", {}).items()}
+        for s in st.get("sites", {}).values():
+            s.pop("health", None)
+        for l in st.get("locations", {}).values():
+            l.pop("last_state", None)
+        return json.dumps(st, sort_keys=True).encode()
+    if arc.endswith("/etc/vpnadmin/auth.json"):
+        a = json.loads(data)
+        a.pop("totp_last", None)
+        return json.dumps(a, sort_keys=True).encode()
+    return data
+
+
+def backup_status():
+    bs = read_json(BACKUP_STATE, {})
+    files = []
+    if os.path.isdir(BACKUP_OUT):
+        for fn in os.listdir(BACKUP_OUT):
+            if fn.endswith(".tar.gz.age"):
+                p = f"{BACKUP_OUT}/{fn}"
+                files.append({"name": fn, "size": os.path.getsize(p), "ts": int(os.path.getmtime(p))})
+        files.sort(key=lambda x: (x["ts"], x["name"]), reverse=True)          # newest first
+    return {"configured": os.path.exists(BACKUP_PUB), "age": bool(age_bin()), "files": files,
+            "last_ok": bs.get("last_ok", 0), "last_error": bs.get("last_error", ""), "last_signal": bs.get("last_signal", 0),
+            "last_size": bs.get("last_size", 0), "last_changed": bs.get("last_changed", 0)}
+
+
+def backup_unit_files():
+    svc = (T("[Unit]\nDescription=wgctl: щоденна зашифрована резервна копія\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/wgctl backup run\n"))
+    tim = (T("[Unit]\nDescription=wgctl: резервна копія щодня о 03:40\n\n[Timer]\nOnCalendar=*-*-* 03:40:00 ") + TZ.key + "\nRandomizedDelaySec=5min\nPersistent=true\n\n"
+           "[Install]\nWantedBy=timers.target\n")
+    return {P("/etc/systemd/system/wgctl-backup.service"): svc, P("/etc/systemd/system/wgctl-backup.timer"): tim}
+
+
+def need_tty(what):
+    """Key operations from a terminal only: the panel (no TTY) cannot run them."""
+    if not os.isatty(0) and not os.environ.get("WGCTL_ALLOW_NOTTY"):
+        die(T("{0}: запускайте з терміналу через SSH", what))
+
+
+def cmd_backup_init(a):
+    need_tty(T("Створення ключа шифрування"))
+    if not age_bin() or not shutil.which("age-keygen"):
+        die(T("Потрібна програма age: sudo apt install age"))
+    if os.path.exists(BACKUP_PUB) and not a.force:
+        die(T("Ключ шифрування вже створено ({0}). Новий: wgctl backup init --force (старі копії тоді розшифрує лише старий ключ)", BACKUP_PUB))
+    r = run(["age-keygen"])
+    secret = next(ln for ln in r.stdout.splitlines() if ln.startswith("AGE-SECRET-KEY-"))
+    pub = run(["age-keygen", "-y"], secret + "\n").stdout.strip()
+    write_file(BACKUP_PUB, pub + "\n", 0o644)
+    for path, text in backup_unit_files().items():
+        write_file(path, text, 0o644)
+    if not DRY:
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", "--now", "wgctl-backup.timer"])
+    log(T("EVENT:security Створено ключ шифрування резервних копій"))
+    print(T("Ключ для РОЗШИФРУВАННЯ резервних копій (показується один раз, на сервері не зберігається):\n"))
+    print(f"    {secret}\n")
+    print(T("Збережіть його в менеджері паролів. Без нього копії відновити неможливо."))
+    print(T("Далі: sudo wgctl backup run   і перевірка ключа: sudo wgctl backup verify"))
+
+
+def build_archive(out_path):
+    """tar.gz straight into age: there is never an unencrypted archive on disk. Returns (file count, fingerprint)."""
+    with open(BACKUP_PUB) as f:
+        recipient = f.read().strip()
+    fp = hashlib.sha256()
+    files = backup_files()
+    manifest = {"version": VERSION, "host": os.uname().nodename, "created": now(),
+                "files": [arc for _, arc in files] + ["/var/lib/wgctl/history.db"]}
+    tmp = out_path + ".part"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "wb") as out:
+        proc = subprocess.Popen([age_bin(), "-r", recipient], stdin=subprocess.PIPE, stdout=out, stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=proc.stdin, mode="w|gz") as tar:
+                def add_bytes(name, data, mode=0o600, mtime=None, owner=("root", "root")):
+                    ti = tarfile.TarInfo(name.lstrip("/"))
+                    ti.size, ti.mode, ti.mtime = len(data), mode, mtime or now()
+                    ti.uname, ti.gname = owner
+                    tar.addfile(ti, io.BytesIO(data))
+                add_bytes("MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=1).encode())
+                for full, arc in files:
+                    try:                                  # O_NOFOLLOW: the file cannot be swapped for a link between the check and the read
+                        fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW)
+                    except OSError:
+                        continue
+                    with os.fdopen(fd, "rb") as f:
+                        stt = os.fstat(f.fileno())
+                        data = f.read()
+                    add_bytes(arc, data, stt.st_mode & 0o7777, int(stt.st_mtime), owner_names(stt))
+                    if not VOLATILE.search(arc):
+                        fp.update(arc.encode() + b"\0" + hashlib.sha256(norm_for_fingerprint(arc, data)).digest())
+                h = hist_bytes()
+                if h:
+                    add_bytes("/var/lib/wgctl/history.db", h)
+        finally:
+            proc.stdin.close()
+            err = proc.stderr.read().decode(errors="replace")
+            rc = proc.wait()
+    if rc != 0:
+        os.remove(tmp)
+        raise RuntimeError(f"age: {err.strip()}")
+    os.replace(tmp, out_path)
+    return len(files) + 1, fp.hexdigest()
+
+
+def cmd_backup_run(a):
+    if not os.path.exists(BACKUP_PUB):
+        die(T("Спершу створіть ключ шифрування: sudo wgctl backup init"))
+    if not age_bin():
+        die(T("Потрібна програма age: sudo apt install age"))
+    os.makedirs(BACKUP_OUT, mode=0o700, exist_ok=True)
+    stamp = dt.datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
+    path = f"{BACKUP_OUT}/wgctl-{stamp}.tar.gz.age"
+    bs = read_json(BACKUP_STATE, {})
+    try:
+        n, fp = build_archive(path)
+    except Exception as ex:
+        bs["last_error"] = str(ex)[:300]
+        write_file(BACKUP_STATE, json.dumps(bs) + "\n", 0o644)
+        notify(T("Резервна копія не створилась: {0}", bs['last_error']), "health", level="critical", icon="💾", link="/server")
+        flush_outbox()
+        die(T("Помилка: {0}", ex))
+    for f in backup_status()["files"][BACKUP_KEEP:]:
+        os.remove(f"{BACKUP_OUT}/{f['name']}")
+    size = os.path.getsize(path)
+    changed = fp != bs.get("fingerprint")
+    bs.update(last_ok=now(), last_error="", last_size=size, last_file=os.path.basename(path))
+    if changed:
+        bs["fingerprint"], bs["last_changed"] = fp, now()
+    send = a.signal or changed and bs.get("signal_fp") != fp or now() - bs.get("last_signal", 0) > BACKUP_SIGNAL_DAYS * 86400
+    sent_to = []
+    if send and not a.no_signal:
+        sent_to = backup_to_signal(path, changed)
+        if sent_to:
+            bs["last_signal"], bs["signal_fp"] = now(), fp
+    write_file(BACKUP_STATE, json.dumps(bs) + "\n", 0o644)
+    log(T("EVENT:info Резервна копія {0}: файлів {1}, {2}", os.path.basename(path), n, human(size))
+        + (T(", конфігурація змінилась") if changed else "") + (T(", у Signal: {0}", ', '.join(sent_to)) if sent_to else ""))
+    print(T("Копія {0}: файлів {1}, {2}", path, n, human(size)) + (T(", у черзі в Signal") if sent_to else ""))
+    flush_outbox()
+
+
+def backup_to_signal(path, changed):
+    """A copy of the archive for signal-cli and one message to each admin privately (not to the group)."""
+    cfg = notify_cfg()
+    admins = cfg.get("admins", [])
+    if not admins or not cfg.get("sender"):        # the sender number is not registered yet: the backup stays on the VPS only
+        return []
+    # The directory belongs to user signal: do not trust what is in it (links could make root
+    # write or chown someone else's file), so links are never followed.
+    if os.path.islink(SIGNAL_OUT) or (os.path.lexists(SIGNAL_OUT) and not os.path.isdir(SIGNAL_OUT)):
+        os.remove(SIGNAL_OUT)
+    os.makedirs(SIGNAL_OUT, mode=0o700, exist_ok=True)
+    uid = gid = None
+    if os.geteuid() == 0 and not DRY:
+        import pwd
+        try:
+            pw = pwd.getpwnam(SIGNAL_USER)
+            uid, gid = pw.pw_uid, pw.pw_gid
+            os.chown(SIGNAL_OUT, uid, gid, follow_symlinks=False)
+        except KeyError:
+            pass
+    dst = f"{SIGNAL_OUT}/{os.path.basename(path)}"
+    if os.path.lexists(dst):
+        os.remove(dst)
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as out, open(path, "rb") as src:
+        shutil.copyfileobj(src, out)
+        if uid is not None:
+            os.fchown(out.fileno(), uid, gid)
+    text = (T("Резервна копія {0} {1}, {2}. ", DOMAIN, fmt_ts(now()), human(os.path.getsize(path)))
+            + (T("Конфігурація змінилась. ") if changed else T("Щотижнева копія. "))
+            + T("Зашифровано: відкрити можна лише вашим ключем age. Відновлення: wgctl backup restore"))
+    enqueue([{"to": x, "group": False, "kind": "backup", "text": text, "attach": dst} for x in admins], replace_kind="backup")
+    return admins
+
+
+def ask_identity():
+    """age key from hidden input into a file on tmpfs (0600) that is removed after use."""
+    import getpass
+    secret = os.environ.get("WGCTL_AGE_KEY") or getpass.getpass(T("Ключ розшифрування (AGE-SECRET-KEY-...): ")).strip()
+    if not secret.startswith("AGE-SECRET-KEY-"):
+        die(T("Це не схоже на ключ age"))
+    d = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    fd, path = tempfile.mkstemp(dir=d, prefix="wgctl-id-")
+    with os.fdopen(fd, "w") as f:
+        f.write(secret + "\n")
+    return path
+
+
+def open_archive(path, identity):
+    """Decrypts into memory and returns {name: (TarInfo, bytes)}."""
+    r = subprocess.run([age_bin(), "-d", "-i", identity, path], capture_output=True)
+    if r.returncode != 0:
+        die(T("Не вдалося розшифрувати: ") + r.stderr.decode(errors="replace").strip()
+            + T("\nПеревірте, що це ключ саме від цих копій."))
+    out = {}
+    with tarfile.open(fileobj=io.BytesIO(r.stdout), mode="r:gz") as tar:
+        for ti in tar.getmembers():
+            if not ti.isfile() or ti.name.startswith("/") or ".." in ti.name.split("/"):
+                continue                                   # only regular files with safe paths
+            out[ti.name] = (ti, tar.extractfile(ti).read())
+    return out
+
+
+def pick_backup(name):
+    if name:
+        return name if os.path.sep in name else f"{BACKUP_OUT}/{name}"
+    files = backup_status()["files"]
+    if not files:
+        die(T("Копій ще немає: sudo wgctl backup run"))
+    return f"{BACKUP_OUT}/{files[0]['name']}"
+
+
+def cmd_backup_status(a):
+    b = backup_status()
+    if a.json:
+        print(json.dumps(b, ensure_ascii=False))
+        return
+    if not b["configured"]:
+        print(T("Не налаштовано: sudo wgctl backup init"))
+        return
+    print(T("Остання копія: {0}, у Signal: {1}", fmt_ts(b['last_ok']), fmt_ts(b['last_signal']))
+          + (T(", помилка: {0}", b['last_error']) if b["last_error"] else ""))
+    for x in b["files"]:
+        print(f"  {x['name']}  {human(x['size'])}")
+
+
+def cmd_backup_verify(a):
+    path = pick_backup(a.file)
+    ident = ask_identity()
+    try:
+        items = open_archive(path, ident)
+    finally:
+        shred(ident)
+    man = json.loads(items["MANIFEST.json"][1]) if "MANIFEST.json" in items else {}
+    print(T("Ключ підходить. {0}: файлів {1}, створено {2}, wgctl {3}", os.path.basename(path), len(items) - 1, fmt_ts(man.get('created')), man.get('version', '?')))
+    log(T("EVENT:info Перевірено ключ розшифрування резервних копій"))
+
+
+def cmd_backup_restore(a):
+    """Restore: show the contents; with --apply write the files back and restart the services."""
+    need_tty(T("Відновлення"))
+    path = pick_backup(a.file)
+    ident = ask_identity()
+    try:
+        items = open_archive(path, ident)
+    finally:
+        shred(ident)
+    files = sorted(n for n in items if n != "MANIFEST.json")
+    skipped = [n for n in files if not restorable(n)]
+    files = [n for n in files if restorable(n)]
+    if skipped:
+        print(T("Пропущено {0} файлів поза переліком копії: {1}", len(skipped), ", ".join(skipped[:5])))
+    print(T("У копії {0} файлів:", len(files)))
+    for n in files:
+        print(f"  /{n}")
+    if not a.apply:
+        print(T("\nЦе лише перегляд. Записати файли на місце: sudo wgctl backup restore <файл> --apply"))
+        return
+    if not a.yes and input(T("Перезаписати поточні файли цими? Напишіть так: ")).strip().lower() != T("так"):
+        die(T("Скасовано"))
+    if os.path.exists(BACKUP_PUB) and age_bin():
+        try:
+            pre = f"{BACKUP_OUT}/wgctl-before-restore-{dt.datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}.tar.gz.age"
+            os.makedirs(BACKUP_OUT, mode=0o700, exist_ok=True)
+            build_archive(pre)
+            print(T("Поточний стан збережено: {0}", pre))
+        except Exception as ex:
+            print(T("Не вдалося зберегти поточний стан ({0}), продовжую", ex))
+    for n in files:
+        if n.startswith("var/log/"):
+            continue                          # the current log is not overwritten: it holds events after the backup
+        ti, data = items[n]
+        dst = P("/" + n)
+        uid, gid = restore_owner(n, ti)
+        makedirs_owned(os.path.dirname(dst), uid, gid)
+        tmp = dst + ".wgctl-restore"
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, ti.mode & 0o777 or 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            if os.geteuid() == 0:
+                os.fchown(f.fileno(), uid, gid)
+        os.replace(tmp, dst)
+    log(T("EVENT:security Відновлено з резервної копії {0} ({1} файлів)", os.path.basename(path), len(files)))
+    if not DRY:
+        for cmd in (["systemctl", "daemon-reload"], ["nft", "-f", "/etc/nftables.conf"],
+                    ["systemctl", "restart", "wg-quick@wg0"], ["systemctl", "reload-or-restart", "caddy"],
+                    ["systemctl", "restart", "vpnadmin"], ["systemctl", "reload", "ssh"],
+                    ["/usr/local/sbin/wgctl", "render"]):
+            r = run(cmd, check=False)
+            print((T("ок   ") if r.returncode == 0 else T("збій ")) + " ".join(cmd)
+                  + ("" if r.returncode == 0 else f": {(r.stderr or r.stdout).strip()[:200]}"))
+    print(T("Готово. Перевірте: sudo wgctl status"))
+
+
+# ---- Signal notifications ---------------------------------------------------
+class OLock(Lock):
+    def __enter__(self):
+        os.makedirs(os.path.dirname(OUTBOX_LOCK), exist_ok=True)
+        self.f = open(OUTBOX_LOCK, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+
+def notify_cfg():
+    try:
+        with open(STATE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    n = {"admins": [], "group": "", "group_name": "", "group_managed": False, "sender": "", "connect": False, "report": True, "users": True,
+         **st.get("notify", {})}
+    return n
+
+
+def admin_targets(cfg, level="info"):
+    """Where an event goes: everything to the group; critical events also to admins privately.
+    Until there is a group, everything goes to admins privately."""
+    admins = [{"to": a, "group": False} for a in cfg.get("admins", [])]
+    if not cfg.get("group"):
+        return admins
+    return [{"to": cfg["group"], "group": True}] + (admins if level == "critical" else [])
+
+
+def parse_phones(v):
+    if v in (None,):
+        return None
+    out = []
+    for x in v.replace(" ", "").split(","):
+        if not x or x == "none":
+            continue
+        if not PHONE_RE.match(x):
+            die(T("Телефон {0}: потрібен міжнародний формат, напр. +380671234567", x))
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def load_outbox():
+    try:
+        with open(OUTBOX) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"queue": [], "last_sent": 0, "last_error": "", "last_receive": 0, "sent_total": 0}
+
+
+def save_outbox(ob):
+    write_file(OUTBOX, json.dumps(ob, ensure_ascii=False, indent=1) + "\n")
+
+
+def drop_attach(q):
+    if q.get("attach") and os.path.exists(q["attach"]):
+        os.remove(q["attach"])
+
+
+def enqueue(items, replace_kind=None):
+    t = now()
+    with OLock():
+        ob = load_outbox()
+        if replace_kind:                       # e.g. a backup: only the newest one stays in the queue
+            keep = []
+            for q in ob["queue"]:
+                if q.get("kind") == replace_kind:
+                    drop_attach(q)
+                else:
+                    keep.append(q)
+            ob["queue"] = keep
+        ob["recent"] = [r for r in ob.get("recent", []) if t - r[0] < 600]
+        for it in items:
+            key = hashlib.sha256(f"{it['to']}|{it['text']}".encode()).hexdigest()[:16]
+            if any(r[1] == key for r in ob["recent"]):
+                continue                                  # the same text to the same recipient within 10 minutes
+            ob["recent"].append([t, key])
+            ob["queue"].append({**it, "ts": t, "tries": 0, "err": ""})
+        del ob["queue"][:-500]
+        save_outbox(ob)
+
+
+def signal_bin():
+    return shutil.which("signal-cli") or ("/usr/local/bin/signal-cli" if os.path.exists("/usr/local/bin/signal-cli") else None)
+
+
+def signal_run(args, timeout=60, raw=False):
+    """Runs signal-cli as user signal. Returns (rc, output); raw=True: full stdout."""
+    if SIGNAL_FAKE:
+        if os.environ.get("WGCTL_SIGNAL_FAIL"):
+            return 1, "fake failure"
+        with open(SIGNAL_FAKE, "a") as f:
+            f.write(json.dumps(args, ensure_ascii=False) + "\n")
+        if "listGroups" in args:
+            return 0, os.environ.get("WGCTL_SIGNAL_GROUPS", "[]")
+        if "updateGroup" in args:
+            return 0, 'Created new group: "FAKEGROUPID0000000000000000000000000000000="'
+        return 0, ""
+    b = signal_bin()
+    if not b:
+        return 127, T("signal-cli не встановлено")
+    cmd = [b, "--config", SIGNAL_DIR] + args
+    if os.geteuid() == 0:
+        cmd = ["runuser", "-u", SIGNAL_USER, "--"] + cmd
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, T("signal-cli: тайм-аут")
+    if raw and r.returncode == 0:
+        return 0, r.stdout
+    return r.returncode, (r.stderr or r.stdout).strip()[-500:]
+
+
+def utf16_len(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def format_batch(batch):
+    """A message for one recipient: a header (bold), events with icons and panel links;
+    the report and messages to users as separate paragraphs. Returns (text, header length in UTF-16)."""
+    adm = [q for q in batch if q["kind"] == "admin"]
+    other = [q["text"] for q in batch if q["kind"] != "admin"]
+    levels = {q.get("level") for q in adm}
+    head = ""
+    lines = []
+    if adm:
+        top = "🚨" if "critical" in levels else "⚠️" if "warning" in levels else "🛡"
+        crit = T("Потрібна увага") if "critical" in levels else ""
+        head = f"{top} {BRAND}" + (f" · {crit}" if crit else "")
+        for q in adm:
+            icon = q.get("icon") or "•"
+            lines.append(f"{icon} {fmt_ts(q['ts'])[11:]}  {q['text']}")          # event time right after the icon
+            if q.get("url"):
+                lines.append(f"    ↳ {q['url']}")
+    parts = ([head + "\n" + "\n".join(lines)] if adm else []) + other
+    if not adm and other:                          # report: its first line in bold
+        head = other[0].split("\n", 1)[0]
+    return "\n\n".join(parts), utf16_len(head)
+
+
+def flush_outbox(force=False):
+    """Sends the queue. Does nothing without a configured number (messages wait up to 24 hours)."""
+    cfg = notify_cfg()
+    t = now()
+    with OLock():
+        ob = load_outbox()
+        old = [q for q in ob["queue"] if t - q["ts"] > 86400]
+        if old:
+            for q in old:
+                drop_attach(q)
+            ob["queue"] = [q for q in ob["queue"] if t - q["ts"] <= 86400]
+            log(T("signal: {0} повідомлень старші за 24 год, не надіслано", len(old)))
+        sender = cfg.get("sender")
+        if not sender or not (SIGNAL_FAKE or signal_bin()):
+            save_outbox(ob)
+            return 0
+        if force or t - ob.get("last_receive", 0) > 1800:      # Signal requires receiving regularly
+            rc, out = signal_run(["-a", sender, "receive", "--timeout", "5"], timeout=90)
+            ob["last_receive"] = t
+            if rc != 0:
+                ob["last_error"] = f"receive: {out}"
+        sent, keep = 0, []
+        by_to = {}
+        for q in ob["queue"]:
+            if q.get("attach"):                      # a file: as a separate message
+                if not os.path.exists(q["attach"]):
+                    continue
+                rc, out = signal_run(["-a", sender, "send", "-m", q["text"], "-a", q["attach"], q["to"]], timeout=180)
+                if rc == 0:
+                    sent += 1
+                    ob["last_sent"], ob["last_error"] = t, ""
+                    ob["sent_total"] = ob.get("sent_total", 0) + 1
+                else:
+                    q["tries"] += 1
+                    q["err"] = ob["last_error"] = f"{q['to']}: {out}"
+                    if q["tries"] < 5:
+                        keep.append(q)
+                    else:
+                        log(T("signal: копію не надіслано ({0}) після 5 спроб: {1}", q['to'], out))
+                continue
+            by_to.setdefault((q["to"], bool(q.get("group"))), []).append(q)
+        for (to, grp), items in by_to.items():
+            batch, rest = items[:10], items[10:]
+            text, bold = format_batch(batch)
+            dest = ["-g", to] if grp else [to]
+            rc, out = 1, ""
+            if bold:                                   # header in bold; an older signal-cli without --text-style: without it
+                rc, out = signal_run(["-a", sender, "send", "-m", text, "--text-style", f"0:{bold}:BOLD"] + dest)
+            if rc != 0:
+                rc, out = signal_run(["-a", sender, "send", "-m", text] + dest)
+            if rc == 0:
+                sent += len(batch)
+                ob["last_sent"], ob["last_error"] = t, ""
+                ob["sent_total"] = ob.get("sent_total", 0) + len(batch)
+            else:
+                ob["last_error"] = f"{T('група') if grp else to}: {out}"
+                for q in batch:
+                    q["tries"] += 1
+                    q["err"] = out
+                    if q["tries"] < 5:
+                        keep.append(q)
+                    else:
+                        log(T("signal: не вдалося надіслати ({0}) після 5 спроб: {1}", T("група") if grp else to, out))
+            keep += rest
+        ob["queue"] = keep
+        save_outbox(ob)
+        pending = {q["attach"] for q in keep if q.get("attach")}
+        if os.path.isdir(SIGNAL_OUT):                # remove sent and abandoned files
+            for fn in os.listdir(SIGNAL_OUT):
+                if f"{SIGNAL_OUT}/{fn}" not in pending:
+                    os.remove(f"{SIGNAL_OUT}/{fn}")
+    return sent
+
+
+def sync_group(old, new):
+    """Group members = admins: add the new ones, remove the removed ones."""
+    cfg = notify_cfg()
+    if not cfg.get("group") or not cfg.get("sender"):
+        return
+    add = [x for x in new if x not in old]
+    rem = [x for x in old if x not in new]
+    if not cfg.get("group_managed"):
+        if add or rem:
+            msg = (T("Склад групи «{0}» не змінено автоматично (група створена не wgctl). ", cfg.get('group_name') or T("сповіщень"))
+                   + (T("Додайте вручну: {0}. ", ', '.join(add)) if add else "")
+                   + (T("Видаліть вручну: {0}.", ', '.join(rem)) if rem else ""))
+            log(f"EVENT:security {msg}")
+            print(msg)
+        return
+    for flag_, nums, what in (("-m", add, T("додано до групи")), ("-r", rem, T("видалено з групи"))):
+        if not nums:
+            continue
+        rc, out = signal_run(["-a", cfg["sender"], "updateGroup", "-g", cfg["group"], flag_] + nums)
+        if rc == 0:
+            log(T("EVENT:security {0}: {1} сповіщень", ', '.join(nums), what))
+        else:
+            msg = (T("Не вдалося оновити групу сповіщень ({0}: {1}): {2}. Перевірте склад групи вручну у Signal", what, ', '.join(nums), out))
+            log(f"EVENT:security {msg}")
+            enqueue([{"to": x, "group": False, "kind": "admin", "text": msg, "level": "warning", "icon": "👥", "url": ""} for x in new])
+            flush_outbox()
+            print(msg)
+
+
+def cmd_notify(a):
+    if a.ncmd == "set":
+        changes = []
+        with Lock():
+            st = load()
+            n = st.setdefault("notify", {})
+            if n.get("admin") and not n.get("admins"):
+                n["admins"] = [n["admin"]]
+            n.pop("admin", None)
+            old_admins = list(n.get("admins", []))
+            admins = parse_phones(a.admins)
+            if admins is not None:
+                n["admins"] = admins
+                changes.append(f"admins={','.join(admins) or '-'}")
+            if a.sender is not None:
+                v = parse_phones(a.sender)
+                if len(v) > 1:
+                    die(T("Відправник лише один"))
+                n["sender"] = v[0] if v else ""
+                changes.append(f"sender={n['sender'] or '-'}")
+            if a.group is not None:
+                grp = "" if a.group in ("", "none") else a.group.strip()
+                if grp and not GROUP_RE.fullmatch(grp):
+                    die(T("ID групи Signal: base64, напр. з wgctl notify groups"))
+                n["group"] = grp
+                n["group_name"] = clean_note(a.group_name) or ("" if not n["group"] else n.get("group_name", ""))
+                n["group_managed"] = False          # a group chosen by hand: members are left alone
+                changes.append(f"group={n['group'][:12] + '…' if n['group'] else '-'}")
+            for key in ("connect", "report", "users"):
+                v = getattr(a, key)
+                if v is not None:
+                    n[key] = onoff(v)
+                    changes.append(f"{key}={'on' if n[key] else 'off'}")
+            if not changes:
+                die(T("Нічого не змінено. Див. wgctl notify set -h"))
+            save(st)
+        log(T("EVENT:info Налаштування сповіщень: ") + ", ".join(changes))
+        if admins is not None and set(admins) != set(old_admins):
+            msg = (T("Змінено номери адміністраторів: {0} -> {1}", ', '.join(old_admins) or '-', ', '.join(admins) or '-'))
+            log(f"EVENT:security {msg}")
+            # privately only, to the old and the new admins: a change cannot be hidden from whoever was removed
+            enqueue([{"to": x, "group": False, "kind": "admin", "text": msg, "level": "critical", "icon": "👤", "url": ""}
+                     for x in dict.fromkeys(old_admins + admins)])
+            flush_outbox()
+            sync_group(old_admins, admins)
+        print(T("Збережено: ") + ", ".join(changes))
+        return
+    if a.ncmd == "test":
+        cfg = notify_cfg()
+        if a.to and not PHONE_RE.match(clean_phone(a.to)):
+            die(T("Телефон у міжнародному форматі, напр. +380671234567"))
+        targets = [{"to": clean_phone(a.to), "group": False}] if a.to else admin_targets(cfg, "critical")
+        if not targets:
+            die(T("Немає ні групи, ні номерів адміністраторів: wgctl notify set --admins +380..."))
+        enqueue([{**t, "kind": "admin", "text": T("Тестове повідомлення ({0}). Якщо ви це бачите, сповіщення працюють.", fmt_ts(now())),
+                  "level": "info", "icon": "🧪", "url": ""} for t in targets])
+        sent = flush_outbox(force=True)
+        ob = load_outbox()
+        where = (T("у групу ") + (cfg.get("group_name") or "")).strip() if targets[0]["group"] else \
+            ", ".join(t["to"] for t in targets)
+        if sent:
+            print(T("Надіслано: {0}", where))
+        elif not cfg.get("sender"):
+            die(T("Повідомлення в черзі: номер-відправник Signal ще не налаштовано"))
+        else:
+            die(T("Не надіслано: {0}", ob.get('last_error') or T("невідома помилка")))
+        return
+    if a.ncmd in ("groups", "create-group"):
+        cfg = notify_cfg()
+        if not cfg.get("sender") or not (SIGNAL_FAKE or signal_bin()):
+            die(T("Спершу зареєструйте номер-відправник і задайте його: wgctl notify set --sender +380..."))
+        if a.ncmd == "create-group":
+            a.gname = clean_note(a.gname).lstrip("-").strip()[:60] or BRAND
+            if not cfg.get("admins"):
+                die(T("Спершу задайте адміністраторів: wgctl notify set --admins +380...,+380..."))
+            rc, out = signal_run(["-a", cfg["sender"], "updateGroup", "-n", a.gname, "-m"] + cfg["admins"])
+            m = re.search(r'"(' + GROUP_RE.pattern + r')"', out) if rc == 0 else None
+            if not m:
+                die(T("Не вдалося створити групу: {0}", out))
+            with Lock():
+                st = load()
+                st.setdefault("notify", {}).update(group=m.group(1), group_name=a.gname, group_managed=True)
+                save(st)
+            notify(T("Створено групу сповіщень «{0}» з адміністраторами: {1}", a.gname, ', '.join(cfg['admins'])), "security",
+                   level="info", icon="👥")
+            flush_outbox(force=True)
+            print(T("Групу «{0}» створено і задано для сповіщень", a.gname))
+            return
+        flush_outbox(force=True)                    # receive refreshes the group list
+        rc, out = signal_run(["-a", cfg["sender"], "-o", "json", "listGroups", "-d"], raw=True)
+        if rc != 0:
+            die(f"signal-cli: {out}")
+        try:
+            groups = [{"id": g["id"], "name": g.get("name", ""), "member": g.get("isMember", True),
+                       "members": len(g.get("members", []))} for g in json.loads(out or "[]")]
+        except ValueError:
+            die(T("Не вдалося прочитати список груп"))
+        if a.json:
+            print(json.dumps(groups, ensure_ascii=False))
+        elif not groups:
+            print(T("Груп немає. Створіть: wgctl notify create-group \"{0}\" або додайте номер-відправник у групу з телефона", BRAND))
+        else:
+            for g in groups:
+                print(T("{0}  учасників {1}  id {2}", g['name'] or T("(без назви)"), g['members'], g['id'])
+                      + ("" if g["member"] else T("  [не учасник]")))
+        return
+    if a.ncmd == "flush":
+        print(T("Надіслано: {0}", flush_outbox(force=True)))
+        return
+    if a.ncmd == "clear":
+        with OLock():
+            ob = load_outbox()
+            n = len(ob["queue"])
+            ob["queue"] = []
+            save_outbox(ob)
+        print(T("Чергу очищено ({0})", n))
+        return
+    cfg, ob = notify_cfg(), load_outbox()
+    b = signal_bin()
+    out = {**cfg, "signal_cli": bool(b or SIGNAL_FAKE), "ready": bool(cfg.get("sender") and (b or SIGNAL_FAKE)),
+           "queue": len(ob["queue"]), "last_sent": ob.get("last_sent", 0), "last_error": ob.get("last_error", ""),
+           "sent_total": ob.get("sent_total", 0),
+           "pending": [{"ts": q["ts"], "to": q["to"], "kind": q["kind"], "text": q["text"][:120], "err": q["err"]}
+                       for q in ob["queue"][-20:]]}
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    print("signal-cli:          " + (T("встановлено") if out['signal_cli'] else T("не встановлено")))
+    print(T("Номер-відправник:    {0}", cfg.get('sender') or T("не налаштовано")))
+    print(T("Адміністратори:      {0} (приватно: критичне і зміни адмінів)", ', '.join(cfg.get('admins', [])) or T("не задано")))
+    print(T("Груповий чат:        {0}", (cfg.get('group_name') or T("без назви")) + T(" (усі сповіщення)") if cfg.get('group') else T("не задано (усе йде адмінам приватно)")))
+    print(T("Підключення/відключення: {0}", T("надсилати") if cfg.get('connect') else T("лише журнал")))
+    print(T("Щоденний звіт 08:00: {0}", T("так") if cfg.get('report') else T("ні")))
+    print(T("Повідомлення користувачам: {0}", T("так") if cfg.get('users') else T("ні")))
+    print(T("Черга: {0}, надіслано всього: {1}, останнє: {2}", out['queue'], out['sent_total'], fmt_ts(out['last_sent'])))
+    if out["last_error"]:
+        print(T("Остання помилка:     {0}", out['last_error']))
+
+
+def cmd_report(a):
+    st = load()
+    peers = dump()
+    t = now()
+    lines = [T("📊 {0} · звіт за {1}", BRAND, dt.datetime.fromtimestamp(t, TZ).strftime('%d.%m.%Y'))]
+    exp = cert_expiry()
+    days = (exp - t) // 86400 if exp else None
+    loc = []
+    for n, l in st["locations"].items():
+        v = location_view(n, l, peers)
+        loc.append((l.get("title") or n) + (" ✅" if v['state'] == 'ok' else " ❌"))
+    lines.append(T("🖥 Система: ") + ", ".join(["WireGuard ✅", "Caddy " + ("✅" if service_active("caddy") else "❌")] + loc))
+    if days is not None:
+        lines.append(T("🔐 Сертифікат: ще {0} дн", days) + (" ⚠️" if days <= 14 else ""))
+    cl = st["clients"]
+    active = [n for n, c in cl.items() if c["status"] == "active"]
+    disabled = [n for n, c in cl.items() if c["status"] == "disabled"]
+    seen = sorted(n for n, c in cl.items() if c["status"] != "revoked" and t - c.get("last_seen", 0) < 86400)
+    lines.append(T("👥 Ключі: активних {0}, вимкнених {1}", len(active), len(disabled)))
+    lines.append(T("📶 За добу підключались: ") + (", ".join(seen) if seen else T("ніхто")))
+    attn = [T("{0} (підозра)", n) for n, c in cl.items() if c.get("suspect") and c["status"] != "revoked"]
+    attn += [T("{0} (відкликання через {1} дн)", n, INACTIVE_DAYS - (t - idle_from(c)) // 86400) for n, c in cl.items()
+             if c["status"] == "active" and c.get("autorevoke", True) and not c.get("guest_until")
+             and INACTIVE_DAYS - (t - idle_from(c)) // 86400 <= WARN_DAYS]
+    attn += [T("{0} (термін до {1})", n, c['expires']) for n, c in cl.items() if c["status"] == "active" and c.get("expires")
+             and (dt.date.fromisoformat(c["expires"]) - dt.datetime.now(TZ).date()).days <= EXPIRY_WARN_DAYS]
+    attn += [T("{0} (час змінити ключ)", n) for n, c in cl.items() if c["status"] == "active" and not c.get("guest_until")
+             and rotate_days(st) and (t - c.get("rotated", c["created"])) // 86400 >= rotate_days(st)]
+    guests = [T("{0} до {1}", n, fmt_ts(c['guest_until'])[11:]) for n, c in cl.items() if c["status"] != "revoked" and c.get("guest_until")]
+    if guests:
+        lines.append(T("🎟 Гості: ") + ", ".join(guests))
+    lines.append((T("⚠️ Потребують уваги: ") + ", ".join(attn)) if attn else T("👌 Нічого не потребує уваги"))
+    bad = [n for n, s in st["sites"].items() if s.get("health") and not s["health"].get("ok")]
+    pub = [n for n, s in st["sites"].items() if s.get("public")]
+    lines.append(T("🌐 Сайти: {0}", len(st['sites'])) + (T(", не відповідають: {0} ❌", ', '.join(bad)) if bad else T(", усі відповідають ✅"))
+                 + (T("; публічні: {0}", ', '.join(pub)) if pub else ""))
+    cnt = {}
+    since = dt.datetime.fromtimestamp(t - 86400, TZ).strftime("%Y-%m-%d %H:%M")
+    for path in (LOG + ".1", LOG):
+        if not os.path.exists(path):
+            continue
+        for l in open(path, errors="replace"):
+            m = re.match(r"^(\S+ \S+) EVENT(?::(\w+))? ", l)
+            if m and m.group(1) >= since:
+                c = m.group(2) or "info"
+                cnt[c] = cnt.get(c, 0) + 1
+    b = backup_status()
+    if b["configured"]:
+        lines.append(T("💾 Резервна копія: {0}", fmt_ts(b['last_ok']) if b['last_ok'] else T("ще не було"))
+                     + (T(", помилка: {0} ❌", b['last_error']) if b["last_error"] else " ✅"))
+    rel = read_json(SERVER_CACHE, {}).get("rel")
+    if rel:
+        lines.append(T("⬆️ Доступна версія {0}: sudo wgctl-update", rel))
+    lines.append(T("🧾 Події за добу: ") + (", ".join(f"{CAT_UA.get(k, k)} {v}" for k, v in sorted(cnt.items()))
+                                      if cnt else T("немає")))
+    text = "\n".join(lines)
+    if a.print or not notify_cfg().get("report", True):
+        print(text)
+        return
+    cfg = notify_cfg()
+    targets = admin_targets(cfg)
+    if not targets:
+        die(T("Немає ні групи, ні номерів адміністраторів: wgctl notify set --admins +380..."))
+    enqueue([{**t, "kind": "report", "text": text} for t in targets])
+    log(T("EVENT:info Сформовано щоденний звіт"))
+    print(T("Звіт у черзі, надіслано: {0}", flush_outbox()))
+
+
+# ---- log -------------------------------------------------------------------
+def cmd_log(a):
+    lines = []
+    for path in (LOG + ".1", LOG):          # the previous part after rotation + the current one
+        if os.path.exists(path):
+            with open(path, errors="replace") as f:
+                lines += f.read().splitlines()
+    if a.events:
+        lines = [l for l in lines if " EVENT" in l[:24]]
+    if a.client:
+        lines = [l for l in lines if re.search(rf"\b{re.escape(a.client)}\b", l)]
+    out = []
+    for l in lines:
+        m = re.match(r"^(\S+ \S+) EVENT(?::(\w+))? (.*)$", l)
+        if m:
+            out.append({"ts": m.group(1), "cat": m.group(2) or "info", "text": m.group(3)})
+        elif not a.events:
+            out.append({"ts": l[:16], "cat": "system", "text": l[17:]})
+    if a.cat:
+        out = [x for x in out if x["cat"] == a.cat]
+    out = out[-a.n:]
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print("\n".join(f"{x['ts']} [{CAT_UA.get(x['cat'], x['cat'])}] {x['text']}" for x in out)
+              if out else T("Журнал порожній"))
+
+
+# ---- first setup ------------------------------------------------------------
+CONFIG_TEMPLATE = T("# wgctl / vpnadmin: налаштування хаба. Після змін: sudo wgctl render && sudo systemctl restart vpnadmin\n[general]\nlanguage = \"{{language}}\"          # uk | en: CLI, сповіщення і типова мова панелі\ntimezone = \"{{timezone}}\"\n\n[network]\ndomain = \"{{domain}}\"              # сайти стануть ім'я.{{domain}}\npublic_ip = \"{{public_ip}}\"        # публічна адреса VPS\nendpoint_host = \"{{endpoint_host}}\"  # що писати в конфіги клієнтів (IP або DNS-ім'я)\nlisten_port = {{listen_port}}\nsubnet = \"{{subnet}}\"              # /24: .1 хаб, локації з locations_from по locations_to, клієнти з clients_from по clients_to\nlocations_from = 2\nlocations_to = 9\nclients_from = {{clients_from}}\nclients_to = {{clients_to}}\ninterface = \"wg0\"\nreserved_names = []              # імена, які не можна дати сайтам (напр. зайняті іншими записами DNS)\n\n[panel]\nsubdomain = \"vpnadmin\"           # панель: vpnadmin.{{domain}}\nbrand = \"{{brand}}\"                # назва в шапці панелі та в сповіщеннях\n\n[policy]\ninactive_days = 60               # автовідкликання після стількох днів без підключень\nwarn_days = 7\nguest_max_hours = 72\nrotate_days = 180                # нагадувати змінити ключ (0 = ні)\n\n[update]\nrepo = \"Hyrol7/wgctl-hub\"        # звідки sudo wgctl-update бере релізи\n")
+
+
+def detect_public_ip():
+    r = run(["ip", "-4", "route", "get", "1.1.1.1"], check=False)
+    m = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)", r.stdout)
+    return m.group(1) if m else ""
+
+
+def detect_timezone():
+    try:
+        return os.path.realpath("/etc/localtime").split("/zoneinfo/", 1)[1]
+    except (IndexError, OSError):
+        return "UTC"
+
+
+def ask(prompt, default="", check=None):
+    while True:
+        v = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip() or default
+        if not check or check(v):
+            return v
+        print(T("  Невірне значення, спробуйте ще раз"))
+
+
+def cmd_init(a):
+    """Creates config.toml, WireGuard keys, an empty state and the main Caddyfile. Overwrites nothing without --force."""
+    if os.path.exists(CONFIG_FILE) and not a.force:
+        die(T("{0} уже є. Перезаписати: wgctl init --force", CONFIG_FILE))
+    inter = not a.yes
+    if inter:
+        need_tty(T("Перше налаштування"))
+    v = {"domain": a.domain, "public_ip": a.public_ip or detect_public_ip(), "listen_port": a.port,
+         "subnet": a.subnet, "timezone": a.timezone or detect_timezone(), "language": a.language,
+         "brand": a.brand, "clients_from": 10, "clients_to": 250}
+    if inter:
+        v["domain"] = ask(T("Домен для сайтів і панелі (напр. example.com)"), v["domain"] or "",
+                          lambda x: re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", x or ""))
+        v["public_ip"] = ask(T("Публічна IP-адреса VPS"), v["public_ip"], lambda x: bool(re.fullmatch(r"[\d.]+", x)))
+        v["listen_port"] = int(ask(T("Порт WireGuard (UDP)"), str(v["listen_port"]), str.isdigit))
+        v["subnet"] = ask(T("Внутрішня мережа VPN (/24)"), v["subnet"], lambda x: x.endswith("/24"))
+        v["timezone"] = ask(T("Часовий пояс"), v["timezone"])
+        v["language"] = ask(T("Мова ({0})", "/".join(LANGUAGES)), v["language"], lambda x: x in LANGUAGES)
+        v["brand"] = ask(T("Назва в панелі"), v["brand"])
+    if not v["domain"] or not v["public_ip"]:
+        die(T("Потрібні --domain і --public-ip"))
+    try:
+        ZoneInfo(v["timezone"])
+    except Exception:
+        die(T("Невідомий часовий пояс {0}", v['timezone']))
+    try:
+        net = ipaddress.ip_network(v["subnet"])
+    except ValueError:
+        die(T("wgctl: network.subnet має бути IPv4 /24, напр. 10.77.0.0/24"))
+    if net.prefixlen != 24 or net.version != 4 or not net.is_private:
+        die(T("Мережа має бути /24"))
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", v["domain"] or ""):
+        die(T("Домен для сайтів і панелі (напр. example.com)"))
+    if any(c in (v["brand"] or "") for c in '"\\\n\r<>'):
+        die(T("Назва в панелі") + ": \" \\ < >")
+    v["endpoint_host"] = v["public_ip"]
+    global TZ
+    TZ = ZoneInfo(v["timezone"])
+    write_file(CONFIG_FILE, CONFIG_TEMPLATE.format(**v), 0o644)
+    hub = str(net.network_address).rsplit(".", 1)[0] + ".1"
+    if not os.path.exists(WG_CONF):
+        priv = run(["wg", "genkey"]).stdout.strip()
+        write_file(WG_CONF, f"[Interface]\nAddress = {hub}/24\nListenPort = {v['listen_port']}\nPrivateKey = {priv}\n")
+        print(T("Створено {0} з новим ключем сервера", WG_CONF))
+    if not os.path.exists(STATE):
+        os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+        save({"version": 3, "clients": {}, "locations": {}, "sites": {}, "services": {},
+              "panel": {"enabled": False, "port": 8090}})
+    if not os.path.exists(CADDYFILE) or a.force or "import" not in open(CADDYFILE).read():
+        if os.path.exists(CADDYFILE):
+            backup(CADDYFILE)
+        write_file(CADDYFILE, "{\n\tdefault_bind " + hub + T("\n}}\n\n# Сайти, права і заглушки генерує wgctl\nimport {0}\n", CADDY_GEN), 0o644)
+    log(T("EVENT:security Перше налаштування: {0}, {1}:{2}, {3}", v['domain'], v['public_ip'], v['listen_port'], v['subnet']))
+    print(T("Налаштування записано в {0}.", CONFIG_FILE))
+    print(T("Далі: токен Cloudflare у /etc/caddy/cloudflare.env (CF_API_TOKEN=...), потім sudo wgctl render"))
+
+
+# ---- locations (routers that connect networks to the hub) -----------------------
+def router_conf(priv, ip, psk):
+    return ("[Interface]\n"
+            f"PrivateKey = {priv}\n"
+            f"Address = {ip}/24\n\n"
+            "[Peer]\n"
+            f"PublicKey = {server_pubkey()}\n"
+            f"PresharedKey = {psk}\n"
+            f"Endpoint = {ENDPOINT}\n"
+            f"AllowedIPs = {HUB_IP}/32\n"
+            "PersistentKeepalive = 25\n")
+
+
+def mikrotik_snippet(priv, ip, psk):
+    host, port = ENDPOINT.rsplit(":", 1)
+    return (f'/interface wireguard add name=wg-hub listen-port=13231 private-key="{priv}" comment="{BRAND}"\n'
+            f'/interface wireguard peers add interface=wg-hub public-key="{server_pubkey()}" preshared-key="{psk}" '
+            f'endpoint-address={host} endpoint-port={port} allowed-address={HUB_IP}/32 persistent-keepalive=25s\n'
+            f"/ip address add address={ip}/24 interface=wg-hub\n")
+
+
+def openwrt_snippet(priv, ip, psk):
+    host, port = ENDPOINT.rsplit(":", 1)
+    return ("uci set network.wghub=interface\n"
+            "uci set network.wghub.proto='wireguard'\n"
+            f"uci set network.wghub.private_key='{priv}'\n"
+            f"uci add_list network.wghub.addresses='{ip}/24'\n"
+            "uci add network wireguard_wghub\n"
+            f"uci set network.@wireguard_wghub[-1].public_key='{server_pubkey()}'\n"
+            f"uci set network.@wireguard_wghub[-1].preshared_key='{psk}'\n"
+            f"uci set network.@wireguard_wghub[-1].endpoint_host='{host}'\n"
+            f"uci set network.@wireguard_wghub[-1].endpoint_port='{port}'\n"
+            f"uci add_list network.@wireguard_wghub[-1].allowed_ips='{HUB_IP}/32'\n"
+            "uci set network.@wireguard_wghub[-1].route_allowed_ips='1'\n"
+            "uci set network.@wireguard_wghub[-1].persistent_keepalive='25'\n"
+            "uci commit network\n"
+            "/etc/init.d/network reload\n")
+
+
+ROUTER_FORMATS = {"wg": router_conf, "mikrotik": mikrotik_snippet, "openwrt": openwrt_snippet}
+
+
+def location_keys(name):
+    """Router keys from the saved config (written on add/reissue)."""
+    try:
+        with open(f"{CONF_DIR}/location-{name}.conf") as f:
+            text = f.read()
+    except FileNotFoundError:
+        die(T("Конфіг роутера для {0} не збережено. Нові ключі: wgctl location reissue {1}", name, name))
+    get = lambda k: (re.search(rf"^{k}\s*=\s*(\S+)", text, re.M) or die(T("Пошкоджений конфіг {0}", name))).group(1)
+    return get("PrivateKey"), get("Address").split("/")[0], get("PresharedKey")
+
+
+def host_networks():
+    """Networks the VPS itself sits in (its own addresses and gateway): a location must never take them over,
+    or the hub would route its own traffic, SSH included, into the tunnel."""
+    out = []
+    try:
+        r = run(["ip", "-4", "-o", "addr", "show"], check=False)
+        for dev, cidr in re.findall(r"^\d+:\s+(\S+)\s+inet\s+(\S+)", r.stdout, re.M):
+            if dev != IFACE and not cidr.startswith("127."):
+                out.append(ipaddress.ip_interface(cidr).network)
+        r = run(["ip", "-4", "route", "show", "default"], check=False)
+        out += [ipaddress.ip_network(g + "/32") for g in re.findall(r"\bvia (\d+\.\d+\.\d+\.\d+)", r.stdout)]
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("WGCTL_HOST_NETS"):         # tests
+        out += [ipaddress.ip_network(x) for x in os.environ["WGCTL_HOST_NETS"].split(",")]
+    return out
+
+
+def parse_networks(v, st=None, skip=None):
+    """Networks behind the router. They must not overlap the VPN or another location's networks:
+    in WireGuard an address leads to one peer only, so a second location would take over the first one's network."""
+    out = []
+    for x in (v or "").split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            n = ipaddress.ip_network(x, strict=False)
+        except ValueError:
+            die(T("Мережа {0}: потрібен формат 192.168.1.0/24", x))
+        if (n.version != 4 or n.overlaps(_NETW) or not n.is_private or n.prefixlen < 8
+                or n.is_loopback or n.is_link_local or n.is_multicast or n.is_reserved
+                or n.overlaps(ipaddress.ip_network("0.0.0.0/8"))):
+            die(T("Мережа {0}: лише приватна IPv4, що не перетинається з {1}", x, _NETW))
+        own = next((h for h in host_networks() if n.overlaps(h)), None)
+        if own:
+            die(T("Мережа {0} перетинається з мережею самого VPS ({1})", x, own))
+        for other, l in (st or {}).get("locations", {}).items():
+            if other != skip and any(n.overlaps(ipaddress.ip_network(o, strict=False)) for o in l.get("networks", [])):
+                die(T("Мережа {0} перетинається з мережею локації {1}", x, other))
+        if any(n.overlaps(ipaddress.ip_network(o)) for o in out):
+            die(T("Мережа {0} повторюється", x))
+        out.append(str(n))
+    return out
+
+
+def print_router_conf(name, priv, ip, psk):
+    print(T("Локація {0}: адреса {1}. Конфіг для роутера: {2}/location-{3}.conf", name, ip, CONF_DIR, name))
+    print(T("\nДля MikroTik (RouterOS 7), команди для терміналу:\n"))
+    print(mikrotik_snippet(priv, ip, psk))
+    print(T("Інші роутери: wgctl location conf {0} --format wg|openwrt", name))
+    print(T("Далі: правила брандмауера на роутері, див. docs/uk/locations.md"))
+
+
+def remove_manual_peer(pubkey):
+    """`location adopt`: drop a hand-written [Peer] with this key from the manual part of wg0.conf."""
+    with open(WG_CONF) as f:
+        text = f.read()
+    base = base_conf(text)
+    blocks = re.split(r"(?m)^(?=\[)", base)
+    keep = [b for b in blocks if not (b.lstrip().startswith("[Peer]") and re.search(
+        rf"^PublicKey\s*=\s*{re.escape(pubkey)}\s*$", b, re.M))]
+    if len(keep) == len(blocks):
+        return False
+    shutil.copy2(WG_CONF, WG_CONF + ".before-adopt")
+    write_file(WG_CONF, text.replace(base, "".join(keep).rstrip("\n") + "\n\n", 1), 0o600)
+    return True
+
+
+def cmd_location(a):
+    if a.lcmd == "list":
+        st = load()
+        peers = dump()
+        rows = [location_view(n, l, peers) for n, l in st["locations"].items()]
+        if a.json:
+            print(json.dumps(rows, ensure_ascii=False))
+            return
+        if not rows:
+            print(T("Локацій немає. Додайте: wgctl location add <ім'я> --networks 192.168.1.0/24"))
+            return
+        table([(T("ЛОКАЦІЯ"), T("НАЗВА"), "IP", T("МЕРЕЖІ"), T("СТАН"))] +
+              [(r["name"], r["title"], r["ip"], ", ".join(r["networks"]) or "-", r["state"]) for r in rows])
+        return
+    name = a.name
+    if not NAME_RE.match(name):
+        die(T("Ім'я локації: малі латинські літери, цифри, дефіс"))
+    if a.lcmd == "conf":
+        st = load()
+        st["locations"].get(name) or die(T("Локації {0} немає", name))
+        print(ROUTER_FORMATS[a.format](*location_keys(name)), end="")
+        return
+    with Lock():
+        st = load()
+        locs = st["locations"]
+        if a.lcmd == "add":
+            if name in locs or name in st["clients"] or name in RESERVED:
+                die(T("Ім'я {0} уже зайняте", name))
+            used = {l.get("ip") for l in locs.values()}
+            free = [f"{NET}{i}" for i in range(LOC_MIN, LOC_MAX + 1) if f"{NET}{i}" not in used]
+            if not free:
+                die(T("Вільних адрес для локацій немає"))
+            priv, pub, psk = genkeys()
+            locs[name] = {"ip": free[0], "pubkey": pub, "psk": psk, "networks": parse_networks(a.networks, st),
+                          "managed": True, "sites": [], "panel": bool(a.panel),
+                          "title": clean_note(a.title) or name, "note": "", "created": now()}
+            write_file(f"{CONF_DIR}/location-{name}.conf", router_conf(priv, free[0], psk))
+            save(st)
+            apply(st)
+            notify(T("Додано локацію {0} ({1}, мережі: {2})", name, free[0], ', '.join(locs[name]['networks']) or '-'),
+                   "access", icon="📍")
+            print_router_conf(name, priv, free[0], psk)
+            return
+        l = locs.get(name) or die(T("Локації {0} немає", name))
+        if a.lcmd == "rm":
+            if not l.get("managed"):
+                die(T("Локацію {0} налаштовано вручну у {1}. Спершу: wgctl location adopt {2}", name, WG_CONF, name))
+            if not a.yes:
+                need_tty(T("Видалення локації"))
+                if input(T("Видалити локацію {0}? Хаб утратить зв'язок з її мережами. [y/N] ", name)).strip().lower() not in ("y", "yes", "т", "так"):
+                    die(T("Скасовано"))
+            del locs[name]
+            shred(f"{CONF_DIR}/location-{name}.conf")
+            save(st)
+            apply(st)
+            notify(T("Видалено локацію {0}", name), "access", level="warning", icon="📍")
+            print(T("Локацію {0} видалено", name))
+        elif a.lcmd == "reissue":
+            if not l.get("managed"):
+                die(T("Локацію {0} налаштовано вручну у {1}. Спершу: wgctl location adopt {2}", name, WG_CONF, name))
+            priv, pub, psk = genkeys()
+            l.update(pubkey=pub, psk=psk)
+            write_file(f"{CONF_DIR}/location-{name}.conf", router_conf(priv, l["ip"], psk))
+            save(st)
+            apply(st)
+            notify(T("Нові ключі для локації {0}: роутер треба налаштувати заново", name), "security", level="warning", icon="📍")
+            print_router_conf(name, priv, l["ip"], psk)
+        elif a.lcmd == "adopt":
+            need_tty(T("Передача локації під керування"))
+            if l.get("managed"):
+                die(T("Локацією {0} уже керує wgctl", name))
+            removed = remove_manual_peer(l["pubkey"])
+            l["managed"] = True
+            save(st)
+            apply(st)
+            log(T("EVENT:info Локацію {0} передано під керування wgctl", name))
+            print(T("Локацією {0} тепер керує wgctl{1}. Конфіг роутера не змінився.", name,
+                    T(" (ручний [Peer] прибрано з {0}, копія: {0}.before-adopt)", WG_CONF) if removed else ""))
+        elif a.lcmd == "set":
+            if a.title is not None:
+                l["title"] = clean_note(a.title) or name
+            if a.networks is not None:
+                if not l.get("managed"):
+                    die(T("Мережі локації {0} задано вручну у {1}. Спершу: wgctl location adopt {2}", name, WG_CONF, name))
+                l["networks"] = parse_networks(a.networks, st, skip=name)
+            if a.panel is not None:
+                l["panel"] = onoff(a.panel)
+            if a.note is not None:
+                l["note"] = clean_note(a.note)
+            if a.sites is not None:
+                l["sites"] = parse_sites(st, a.sites)
+            save(st)
+            apply(st)
+            log(T("EVENT:info Змінено локацію {0}", name))
+            print(T("Локацію {0} оновлено", name))
+
+
+# ---- CLI -------------------------------------------------------------------
+# The panel runs as user vpnadmin and calls wgctl through sudo. If the panel were compromised, sudo would give
+# an attacker any wgctl command as root, so only what the panel really uses is allowed.
+# Commands that change the system beyond VPN state (init, tcp setup, backup init/restore/verify, location adopt,
+# panel, cloudflare, geo update, render, monitor) are available from a terminal only.
+PANEL_USER = "vpnadmin"
+PANEL_CMDS = {"status", "list", "show", "log", "conf", "qr", "server", "config", "history", "visits",
+              "add", "reissue", "disable", "enable", "extend", "revoke", "trust", "clear", "set", "grant", "deny", "event"}
+PANEL_SUBCMDS = {"location": {"add", "set", "rm", "list", "conf", "reissue"}, "site": {"add", "set", "rm", "list"}, "tcp": {"add", "set", "rm", "allow", "deny", "list"},
+             "notify": {"show", "set", "test", "groups", "create-group"}, "backup": {"run", "status"}}
+
+
+def panel_allowed(a):
+    if a.cmd in PANEL_CMDS:
+        return True
+    sub = {"location": "lcmd", "site": "scmd", "tcp": "tcmd", "notify": "ncmd", "backup": "bcmd"}.get(a.cmd)
+    return bool(sub) and getattr(a, sub, None) in PANEL_SUBCMDS.get(a.cmd, ())
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wgctl", description=T("Керування VPN-хабом {0} (v{1})", DOMAIN, VERSION))
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sp.add_parser("add", help=T("видати доступ новому пристрою"))
+    p.add_argument("name")
+    p.add_argument("--ip", type=int, help=T("номер адреси {0}-{1}", IP_MIN, IP_MAX))
+    p.add_argument("--note")
+    p.add_argument("--sites", help=T("сайти через кому, * = усі (включно з майбутніми); за замовчуванням жодного"))
+    p.add_argument("--expires", help=T("термін дії РРРР-ММ-ДД"))
+    p.add_argument("--no-autorevoke", action="store_true", help=T("не відкликати за неактивність"))
+    p.add_argument("--admin", action="store_true", help=T("доступ до панелі"))
+    p.add_argument("--phone", help="+15551234567")
+    p.add_argument("--hours", type=int, help=T("гостьовий ключ на 1-{0} год, потім відкличеться сам", GUEST_MAX_HOURS))
+    p.add_argument("--qr", action="store_true", help=T("показати QR у терміналі"))
+    p.set_defaults(f=cmd_add)
+
+    p = sp.add_parser("reissue", help=T("нові ключі для клієнта, старий конфіг перестає працювати"))
+    p.add_argument("name")
+    p.add_argument("--qr", action="store_true", help=T("показати QR у терміналі"))
+    p.set_defaults(f=cmd_reissue)
+
+    p = sp.add_parser("conf", help=T("вивести збережений конфіг"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_conf)
+    p = sp.add_parser("qr", help=T("QR збереженого конфігу"))
+    p.add_argument("name")
+    p.add_argument("--svg", action="store_true")
+    p.set_defaults(f=cmd_qr)
+
+    p = sp.add_parser("list", help=T("клієнти"))
+    p.add_argument("--all", action="store_true", help=T("з відкликаними"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_list)
+    p = sp.add_parser("show", help=T("деталі клієнта"))
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_show)
+
+    p = sp.add_parser("disable", help=T("вимкнути (лишається в мережі, бачить заглушку)"))
+    p.add_argument("name")
+    p.add_argument("--reason", choices=("manual", "suspicious"), default="manual")
+    p.set_defaults(f=cmd_disable)
+    p = sp.add_parser("enable", help=T("увімкнути"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_enable)
+    p = sp.add_parser("extend", help=T("продовжити: скинути відлік автовідкликання; гостю додати години"))
+    p.add_argument("name")
+    p.add_argument("--hours", type=int, help=T("гостьовому ключу: на скільки годин продовжити (типово 2)"))
+    p.set_defaults(f=cmd_extend)
+    p = sp.add_parser("config", help=T("загальні налаштування"))
+    p.add_argument("--rotate-days", type=int, help=T("нагадувати змінити ключ через N дн (0 = не нагадувати)"))
+    p.add_argument("--language", choices=LANGUAGES, help=T("мова CLI, сповіщень і панелі"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_config)
+    p = sp.add_parser("revoke", help=T("відкликати назавжди"))
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(f=cmd_revoke)
+
+    p = sp.add_parser("trust", help=T("«це я»: довіряти поточній країні/провайдеру, зняти позначку"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_trust)
+    p = sp.add_parser("clear", help=T("зняти позначку «кандидат на блокування»"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_clear)
+    geo = sp.add_parser("geo", help=T("геолокація")).add_subparsers(dest="gcmd", required=True)
+    geo.add_parser("update", help=T("завантажити бази DB-IP Lite і список Tor")).set_defaults(f=cmd_geo_update)
+    p = geo.add_parser("lookup", help=T("перевірити IP"))
+    p.add_argument("ip")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_geo_lookup)
+
+    p = sp.add_parser("set", help=T("змінити налаштування клієнта"))
+    p.add_argument("name")
+    p.add_argument("--note")
+    p.add_argument("--expires", help=T("РРРР-ММ-ДД або none"))
+    p.add_argument("--autorevoke", help="on/off")
+    p.add_argument("--admin", help="on/off")
+    p.add_argument("--sites", help=T("список через кому, * або none"))
+    p.add_argument("--phone", help=T("+380XXXXXXXXX або none"))
+    p.add_argument("--notes", help=T("довгі нотатки"))
+    p.set_defaults(f=cmd_set)
+
+    p = sp.add_parser("panel", help=T("увімкнути/вимкнути вебпанель у Caddy"))
+    p.add_argument("state", choices=("on", "off"))
+    p.set_defaults(f=cmd_panel)
+
+    p = sp.add_parser("grant", help=T("дати клієнту чи локації доступ до сайтів"))
+    p.add_argument("who")
+    p.add_argument("sites", nargs="+")
+    p.set_defaults(f=cmd_grant)
+    p = sp.add_parser("deny", help=T("забрати доступ до сайтів"))
+    p.add_argument("who")
+    p.add_argument("sites", nargs="+")
+    p.set_defaults(f=lambda a: cmd_grant(a, revoke=True))
+
+    site = sp.add_parser("site", help=T("сайти *.домен")).add_subparsers(dest="scmd", required=True)
+    p = site.add_parser("add", help=T("додати сайт"))
+    p.add_argument("name")
+    p.add_argument("backend", help=T("http://192.168.1.20:80 або https://192.168.1.21:8006"))
+    p.add_argument("--insecure", action="store_true", help=T("бекенд із самопідписаним сертифікатом"))
+    p.add_argument("--upstream-host", action="store_true", help=T("передавати бекенду його власну адресу як Host"))
+    p.add_argument("--note")
+    p.set_defaults(f=cmd_site_add)
+    p = site.add_parser("set", help=T("змінити сайт"))
+    p.add_argument("name")
+    p.add_argument("--backend")
+    p.add_argument("--insecure", help="on/off")
+    p.add_argument("--upstream-host", help="on/off")
+    p.add_argument("--public", help=T("on/off: відкрити сайт в інтернет через Cloudflare"))
+    p.add_argument("--log", choices=LOG_MODES,
+                   help=T("журнал звернень сайту: full, hide-path (лише перший сегмент шляху), off"))
+    p.add_argument("--log-skip", action="append", metavar=T("ШЛЯХИ"),
+                   help=T("шляхи сайту, які не писати в журнал: /s,/health або кілька прапорців; none очищає"))
+    p.add_argument("--note")
+    p.set_defaults(f=cmd_site_set)
+    p = site.add_parser("rm", help=T("видалити сайт"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_site_rm)
+    p = site.add_parser("list", help=T("список сайтів"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_site_list)
+
+    nt = sp.add_parser("notify", help=T("сповіщення Signal")).add_subparsers(dest="ncmd")
+    p = nt.add_parser("show", help=T("стан і налаштування"))
+    p.add_argument("--json", action="store_true")
+    p = nt.add_parser("set", help=T("налаштування"))
+    p.add_argument("--admins", help=T("номери адміністраторів через кому, +380...,+380... або none"))
+    p.add_argument("--sender", help=T("номер-відправник, зареєстрований у signal-cli, або none"))
+    p.add_argument("--group", help=T("ID групи Signal для загальних сповіщень або none"))
+    p.add_argument("--group-name", help=T("назва групи (для показу)"))
+    p.add_argument("--connect", help=T("on/off: надсилати підключення/відключення"))
+    p.add_argument("--report", help=T("on/off: щоденний звіт"))
+    p.add_argument("--users", help=T("on/off: повідомлення користувачам"))
+    p = nt.add_parser("test", help=T("надіслати тестове"))
+    p.add_argument("--to")
+    p = nt.add_parser("groups", help=T("групи, у яких є номер-відправник"))
+    p.add_argument("--json", action="store_true")
+    p = nt.add_parser("create-group", help=T("створити групу з адміністраторами і задати її"))
+    p.add_argument("gname", metavar=T("назва"))
+    nt.add_parser("flush", help=T("надіслати чергу зараз"))
+    nt.add_parser("clear", help=T("очистити чергу"))
+    sp.choices["notify"].set_defaults(f=cmd_notify, ncmd="show", json=False)
+    p = sp.add_parser("report", help=T("щоденний звіт адміністратору"))
+    p.add_argument("--print", action="store_true", help=T("лише показати"))
+    p.set_defaults(f=cmd_report)
+
+    p = sp.add_parser("cloudflare", help=T("налаштування Cloudflare для публічних сайтів"))
+    p.add_argument("--zone", help=T("Zone ID домену"))
+    p.set_defaults(f=cmd_cloudflare)
+
+    tc = sp.add_parser("tcp", help=T("TCP-сервіси: SSH, RDP тощо через хаб")).add_subparsers(dest="tcmd", required=True)
+    p = tc.add_parser("setup", help=T("разове налаштування (nftables і служби)"))
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(f=cmd_tcp_setup)
+    p = tc.add_parser("add", help=T("додати сервіс"))
+    p.add_argument("name")
+    p.add_argument("target", help=T("IP:порт цілі, напр. 192.168.1.20:22"))
+    p.add_argument("--port", type=int, help=T("порт на хабі {0}-{1} (типово перший вільний)", TCP_PORTS[0], TCP_PORTS[1]))
+    p.add_argument("--note")
+    p.set_defaults(f=cmd_tcp_add)
+    p = tc.add_parser("set", help=T("змінити ціль чи примітку"))
+    p.add_argument("name")
+    p.add_argument("--target")
+    p.add_argument("--note")
+    p.set_defaults(f=cmd_tcp_set)
+    p = tc.add_parser("rm", help=T("видалити сервіс"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_tcp_rm)
+    for n, deny in (("allow", False), ("deny", True)):
+        p = tc.add_parser(n, help=T("дати доступ ключам") if not deny else T("забрати доступ"))
+        p.add_argument("name")
+        p.add_argument("who", nargs="+")
+        p.set_defaults(f=lambda a, d=deny: cmd_tcp_allow(a, d))
+    p = tc.add_parser("list", help=T("список сервісів"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_tcp_list)
+
+    p = sp.add_parser("visits", help=T("журнал відвідувань сайтів (підсумки за дні)"))
+    p.add_argument("--site")
+    p.add_argument("--client")
+    p.add_argument("--days", type=int, default=30, choices=(1, 7, 30, 90))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_visits)
+    p = sp.add_parser("history", help=T("історія для графіків"))
+    p.add_argument("keys", help=T("ключі через кому: rx:mac,tx:mac,on:mac,up:nas,ms:nas,loc:home,load,mem,disk"))
+    p.add_argument("--range", default="24h", choices=list(RANGES))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_history)
+
+    p = sp.add_parser("init", help=T("перше налаштування хаба"))
+    p.add_argument("--domain")
+    p.add_argument("--public-ip")
+    p.add_argument("--port", type=int, default=51820)
+    p.add_argument("--subnet", default="10.77.0.0/24")
+    p.add_argument("--timezone")
+    p.add_argument("--language", choices=LANGUAGES, default="en" if "en" in LANGUAGES else "uk")
+    p.add_argument("--brand", default="VPN hub")
+    p.add_argument("-y", "--yes", action="store_true", help=T("без запитань, лише з параметрів"))
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(f=cmd_init)
+    lc = sp.add_parser("location", help=T("локації: роутери, через які хаб бачить ваші мережі")).add_subparsers(dest="lcmd", required=True)
+    p = lc.add_parser("add", help=T("додати локацію і показати конфіг роутера"))
+    p.add_argument("name")
+    p.add_argument("--networks", default="", help=T("мережі за роутером через кому, напр. 192.168.1.0/24"))
+    p.add_argument("--title")
+    p.add_argument("--panel", action="store_true", help=T("пускати мережу локації в панель"))
+    p.set_defaults(f=cmd_location)
+    p = lc.add_parser("set", help=T("змінити локацію"))
+    p.add_argument("name")
+    p.add_argument("--networks")
+    p.add_argument("--title")
+    p.add_argument("--note")
+    p.add_argument("--panel", choices=("on", "off"))
+    p.add_argument("--sites", help=T("сайти, які відкриває мережа локації (потрібен NAT на роутері): через кому, * або none"))
+    p.set_defaults(f=cmd_location)
+    p = lc.add_parser("rm", help=T("видалити локацію"))
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(f=cmd_location)
+    p = lc.add_parser("conf", help=T("конфіг роутера: wg (файл WireGuard), mikrotik, openwrt"))
+    p.add_argument("name")
+    p.add_argument("--format", choices=list(ROUTER_FORMATS), default="wg")
+    p.set_defaults(f=cmd_location)
+    p = lc.add_parser("reissue", help=T("нові ключі для роутера; старий конфіг перестає працювати"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_location)
+    p = lc.add_parser("adopt", help=T("передати під керування wgctl локацію, яку налаштовано вручну у wg0.conf"))
+    p.add_argument("name")
+    p.set_defaults(f=cmd_location)
+    p = lc.add_parser("list", help=T("список локацій"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_location, name="")
+
+    p = sp.add_parser("server", help=T("стан самого VPS: диск, пам'ять, оновлення, служби, копії"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_server)
+    bk = sp.add_parser("backup", help=T("зашифровані резервні копії")).add_subparsers(dest="bcmd", required=True)
+    p = bk.add_parser("init", help=T("створити ключ шифрування і щоденний таймер"))
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(f=cmd_backup_init)
+    p = bk.add_parser("run", help=T("зробити копію зараз"))
+    p.add_argument("--signal", action="store_true", help=T("надіслати в Signal, навіть якщо нічого не змінилось"))
+    p.add_argument("--no-signal", action="store_true")
+    p.set_defaults(f=cmd_backup_run)
+    p = bk.add_parser("status", help=T("стан копій"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_backup_status)
+    p = bk.add_parser("verify", help=T("перевірити, що ваш ключ розшифровує копію"))
+    p.add_argument("file", nargs="?")
+    p.set_defaults(f=cmd_backup_verify)
+    p = bk.add_parser("restore", help=T("відновити з копії"))
+    p.add_argument("file", nargs="?")
+    p.add_argument("--apply", action="store_true", help=T("записати файли на місце (без нього лише перегляд)"))
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(f=cmd_backup_restore)
+
+    p = sp.add_parser("status", help=T("стан системи"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_status)
+    sp.add_parser("monitor", help=T("перевірка (таймер щохвилини)")).set_defaults(f=cmd_monitor)
+    p = sp.add_parser("event", help=T("записати подію в журнал і сповіщення (для панелі)"))
+    p.add_argument("text")
+    p.add_argument("--cat", choices=list(CAT_UA), default="info")
+    p.add_argument("--level", choices=LEVELS)
+    p.add_argument("--icon", help=T("значок (емодзі)"))
+    p.set_defaults(f=lambda a: (notify(a.text[:300].replace("\n", " "), a.cat, level=a.level,
+                                       icon=(a.icon or "")[:8] or None), flush_outbox()))
+    sp.add_parser("render", help=T("перегенерувати конфіги WireGuard, Caddy і TCP-сервісів")).set_defaults(
+        f=lambda a: apply(load(), force_tcp=True) or print(T("Конфіги перегенеровано")))
+    p = sp.add_parser("log", help=T("журнал"))
+    p.add_argument("-n", type=int, default=30)
+    p.add_argument("--client")
+    p.add_argument("--cat", choices=list(CAT_UA))
+    p.add_argument("--all", dest="events", action="store_false", help=T("разом зі службовими рядками"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_log)
+
+    a = ap.parse_args()
+    if os.environ.get("SUDO_USER") == PANEL_USER and not panel_allowed(a):
+        die(T("Ця команда недоступна з вебпанелі: запустіть її з терміналу через SSH"))
+    if not CFG and a.cmd != "init":
+        die(T("Немає {0}. Спершу: sudo wgctl init", CONFIG_FILE))
+    for attr in ("name", "who"):
+        if isinstance(getattr(a, attr, None), str):
+            setattr(a, attr, getattr(a, attr).lower())
+        elif isinstance(getattr(a, attr, None), list):
+            setattr(a, attr, [x.lower() for x in getattr(a, attr)])
+    if isinstance(getattr(a, "sites", None), list):
+        a.sites = [s.lower() for s in a.sites]
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

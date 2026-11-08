@@ -1,0 +1,4 @@
+# The web panel runs as the unprivileged user vpnadmin and may only call wgctl.
+# Every argument is validated by wgctl itself; the panel never runs a shell.
+Defaults:vpnadmin !requiretty
+vpnadmin ALL=(root) NOPASSWD: /usr/local/sbin/wgctl

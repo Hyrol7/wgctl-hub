@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# wgctl-update: update wgctl and vpnadmin to the latest GitHub release.
+#
+#   sudo wgctl-update              show what changes, ask, back up, install, check the services
+#   sudo wgctl-update --check      only say whether a newer release exists (exit 0: up to date, 10: update available)
+#   sudo wgctl-update --to v1.2.0  install this exact release (also allows going back to an older one)
+#   sudo wgctl-update --rollback   put back the files that were installed before the last update
+#   sudo wgctl-update --yes        do not ask
+#
+# The release is downloaded over HTTPS from github.com/<repo> ([update] repo in /etc/wgctl/config.toml,
+# default Hyrol7/wgctl-hub) and installed with its own `install.sh --upgrade`. Settings and data are never touched;
+# the previous program files are kept in /var/lib/wgctl/rollback for --rollback.
+set -euo pipefail
+
+R="${WGCTL_ROOT:-}"                      # test-only prefix, like wgctl's
+SBIN=$R/usr/local/sbin
+SHARE=$R/usr/local/share/wgctl
+ROLLBACK=$R/var/lib/wgctl/rollback
+CONFIG=$R/etc/wgctl/config.toml
+YES=0 MODE=update TARGET=""
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) MODE=check ;;
+    --rollback) MODE=rollback ;;
+    --to) TARGET="${2:-}"; shift ;;
+    --to=*) TARGET="${1#--to=}" ;;
+    --yes|-y) YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m!! %s\033[0m\n' "$*"; }
+die()  { printf '\033[31mError: %s\033[0m\n' "$*" >&2; exit 1; }
+ask()  { [ "$YES" = 1 ] && return 0; read -r -p "$1 [y/N] " r; [[ "$r" =~ ^[YyТт] ]]; }
+
+[ "$(id -u)" = 0 ] || [ -n "$R" ] || die "run as root: sudo wgctl-update"
+[ -f "$CONFIG" ] || die "$CONFIG not found: the hub is not installed (use install.sh)"
+command -v curl >/dev/null || die "curl is required: sudo apt install curl"
+
+installed() { sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$SBIN/wgctl" 2>/dev/null | head -1; }
+
+# true when version $1 is newer than $2 (plain dotted numbers, an optional leading v)
+newer() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+v = lambda s: tuple(int(x) for x in s.lstrip("v").split("."))
+sys.exit(0 if v(sys.argv[1]) > v(sys.argv[2]) else 1)
+PY
+}
+
+check_services() {
+  local bad=0
+  for s in vpnadmin caddy "wg-quick@$(python3 -c 'import tomllib;print(tomllib.load(open("'"$CONFIG"'","rb")).get("network",{}).get("interface","wg0"))')"; do
+    if systemctl is-enabled --quiet "$s" 2>/dev/null && ! systemctl is-active --quiet "$s"; then
+      warn "$s is not running: journalctl -u $s -n 50"; bad=1
+    fi
+  done
+  return $bad
+}
+
+# ---- rollback -----------------------------------------------------------------
+if [ "$MODE" = rollback ]; then
+  [ -f "$ROLLBACK/wgctl" ] || die "nothing to roll back to ($ROLLBACK is empty)"
+  prev=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$ROLLBACK/wgctl" | head -1)
+  ask "Go back from $(installed) to $prev?" || exit 1
+  install -m 0755 "$ROLLBACK/wgctl" "$SBIN/wgctl"
+  install -m 0755 "$ROLLBACK/vpnadmin" "$SBIN/vpnadmin"
+  rm -rf "$SHARE.old"; mv "$SHARE" "$SHARE.old"; cp -a "$ROLLBACK/share" "$SHARE"; rm -rf "$SHARE.old"
+  wgctl render
+  systemctl restart vpnadmin 2>/dev/null || true
+  say "Rolled back to $prev"
+  check_services || exit 1
+  exit 0
+fi
+
+# ---- which release ------------------------------------------------------------
+REPO=$(python3 -c 'import tomllib;print(tomllib.load(open("'"$CONFIG"'","rb")).get("update",{}).get("repo","Hyrol7/wgctl-hub"))')
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "[update] repo in $CONFIG must look like owner/name"
+CUR=$(installed)
+if [ -z "$TARGET" ]; then
+  TARGET=$(curl -fsSL --proto '=https' --max-time 30 -H 'Accept: application/vnd.github+json' \
+             "https://api.github.com/repos/$REPO/releases/latest" |
+           python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))') ||
+    die "could not ask GitHub for the latest release of $REPO"
+fi
+[[ "$TARGET" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "unexpected release name: '$TARGET'"
+[[ "$TARGET" = v* ]] || TARGET="v$TARGET"
+
+if [ "$MODE" = check ]; then
+  if newer "$TARGET" "$CUR"; then echo "Update available: $CUR -> ${TARGET#v}. Install: sudo wgctl-update"; exit 10; fi
+  echo "Up to date: $CUR (latest release ${TARGET#v})"; exit 0
+fi
+if [ "${TARGET#v}" = "$CUR" ]; then
+  echo "Already on ${TARGET#v}."; exit 0
+fi
+
+# ---- download -----------------------------------------------------------------
+TMP=$(mktemp -d /tmp/wgctl-update.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+say "Downloading $REPO $TARGET"
+curl -fsSL --proto '=https' --max-time 300 -o "$TMP/src.tar.gz" \
+  "https://github.com/$REPO/archive/refs/tags/$TARGET.tar.gz" || die "download failed"
+mkdir "$TMP/src"
+tar -xzf "$TMP/src.tar.gz" -C "$TMP/src" --strip-components=1 --no-same-owner --no-same-permissions
+SRC="$TMP/src"
+for f in install.sh src/wgctl src/vpnadmin; do [ -f "$SRC/$f" ] || die "the release has no $f"; done
+NEW=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$SRC/src/wgctl" | head -1)
+[ "$NEW" = "${TARGET#v}" ] || die "release $TARGET contains version '$NEW'"
+python3 -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' "$SRC/src/wgctl" "$SRC/src/vpnadmin" ||
+  die "the downloaded programs do not parse; nothing was changed"
+
+# what changes: CHANGELOG sections newer than the installed version
+if [ -f "$SRC/CHANGELOG.md" ]; then
+  say "Changes $CUR -> $NEW"
+  python3 - "$SRC/CHANGELOG.md" "$CUR" <<'PY'
+import re, sys
+text, cur = open(sys.argv[1]).read(), sys.argv[2]
+v = lambda s: tuple(int(x) for x in s.split("."))
+for part in re.split(r"(?m)^(?=## )", text):
+    m = re.match(r"## \[?v?(\d+(?:\.\d+)+)", part)
+    try:
+        if m and v(m.group(1)) > v(cur):
+            print(part.rstrip())
+    except ValueError:
+        pass
+PY
+fi
+if ! newer "$NEW" "$CUR"; then warn "$NEW is older than the installed $CUR (downgrade)"; fi
+ask "Install $NEW?" || { echo "Nothing changed."; exit 1; }
+
+# ---- back up, install, check --------------------------------------------------
+if wgctl backup status --json 2>/dev/null | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("configured") else 1)'; then
+  say "Encrypted backup before the update"
+  wgctl backup run --no-signal || { ask "The backup failed. Update anyway?" || exit 1; }
+else
+  warn "encrypted backups are not set up (sudo wgctl backup init); only the program files are kept for --rollback"
+fi
+install -d -m 0700 "$ROLLBACK"
+rm -rf "$ROLLBACK/share"
+install -m 0755 "$SBIN/wgctl" "$ROLLBACK/wgctl"
+install -m 0755 "$SBIN/vpnadmin" "$ROLLBACK/vpnadmin"
+cp -a "$SHARE" "$ROLLBACK/share"
+
+bash "$SRC/install.sh" --upgrade
+sleep 2
+if check_services; then
+  say "Updated: $CUR -> $(installed). Back: sudo wgctl-update --rollback"
+else
+  warn "Something is not running after the update. Go back: sudo wgctl-update --rollback"
+  exit 1
+fi

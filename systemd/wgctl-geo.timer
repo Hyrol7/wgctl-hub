@@ -1,0 +1,10 @@
+[Unit]
+Description=wgctl: update DB-IP Lite and Tor exit lists (timer)
+
+[Timer]
+OnCalendar=Sun *-*-* 04:20:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

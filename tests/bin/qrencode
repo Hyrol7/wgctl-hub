@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake `qrencode` for tests: a tiny valid SVG.
+cat >/dev/null
+echo '<?xml version="1.0"?><svg width="10" height="10" xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="#fff"/></svg>'

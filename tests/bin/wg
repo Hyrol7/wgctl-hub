@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fake `wg` for tests: deterministic-looking keys, no kernel access.
+case "$1" in
+  genkey|genpsk) head -c32 /dev/urandom | base64 ;;
+  pubkey) read k; printf '%s' "$k" | sha256sum | head -c43; echo "=" ;;
+esac

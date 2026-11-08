@@ -1,0 +1,6 @@
+[Unit]
+Description=wgctl: daily report to administrators
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wgctl report

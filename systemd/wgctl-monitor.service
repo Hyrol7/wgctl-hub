@@ -1,0 +1,6 @@
+[Unit]
+Description=wgctl: network check, auto-revoke and notifications
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wgctl monitor

@@ -1,0 +1,5 @@
+# Managed by wgctl (wgctl tcp ...). Empty until the first TCP service is added.
+table inet filter {
+    chain wgctl_tcp {
+    }
+}

@@ -1,0 +1,6 @@
+[Unit]
+Description=wgctl: update DB-IP Lite and Tor exit lists
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wgctl geo update

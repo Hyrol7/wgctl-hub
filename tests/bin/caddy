@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake `caddy` for tests: accepts every config. CI validates the real output separately.
+exit 0
