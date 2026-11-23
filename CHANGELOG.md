@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `wgctl ssh`: SSH to the hub follows panel access. `sudo wgctl ssh setup` replaces the world-open SSH rule in `/etc/nftables.conf` (or a hand-written one) with the chain `wgctl_ssh`, which wgctl keeps equal to the panel list (admin keys, locations with `--panel on`) plus `wgctl ssh allow` extras. Refuses to cut off the current session or leave nobody allowed; `wgctl ssh off` reverts.
+
 ## 1.0.1
 
 - Panel login asks only for the password and a code (there is one account anyway).

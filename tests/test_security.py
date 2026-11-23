@@ -72,7 +72,7 @@ def test_signal_test_recipient_validated(hub_en):
 # --- the panel (sudo from user vpnadmin) can only run what it uses -----------------------------
 @pytest.mark.parametrize("args", [["init", "--yes", "--domain", "x.org", "--public-ip", "1.2.3.4", "--force"],
                                   ["backup", "restore", "/tmp/x", "--apply", "-y"], ["backup", "init"],
-                                  ["tcp", "setup", "-y"], ["location", "adopt", "evil"], ["panel", "off"],
+                                  ["tcp", "setup", "-y"], ["ssh", "setup", "-y"], ["ssh", "allow", "1.2.3.4"], ["location", "adopt", "evil"], ["panel", "off"],
                                   ["render"], ["cloudflare", "--zone", "0" * 32], ["geo", "update"], ["notify", "clear"]])
 def test_panel_user_cannot_run_admin_only_commands(hub_en, args):
     env = dict(hub_en.env, SUDO_USER="vpnadmin")
