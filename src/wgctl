@@ -731,6 +731,7 @@ def apply(st, wg=True, caddy=True, force_tcp=False):
     if caddy:
         apply_caddy(st)
     apply_tcp(st, force_tcp)          # TCP service permissions depend on key state
+    apply_ssh(st)                     # SSH to the hub follows panel access
 
 
 # ---- output helpers ---------------------------------------------------------
@@ -1984,6 +1985,254 @@ def cmd_tcp_setup(a):
     apply_tcp(st)
     log(T("EVENT:security Налаштовано TCP-сервіси (ланцюг wgctl_tcp у nftables)"))
     print(T("Готово. Копія попереднього файлу: {0}.before-wgctl-tcp\nДалі: wgctl tcp add <ім'я> <IP>:<порт>", NFT_CONF))
+
+
+# ---- SSH to the hub: only for keys with panel access ----------------------------
+# One list decides who may manage the hub: keys with "admin" (and locations with "panel") get the web panel
+# and SSH to the VPS through the tunnel. `wgctl ssh allow` adds extra addresses (a home LAN through
+# a location, a fixed public IP as a spare way in). Until `wgctl ssh setup`, SSH stays as install.sh left it.
+SSH_NFT = P("/etc/nftables.d/wgctl-ssh.nft")
+SSH_JUMP = "jump wgctl_ssh"
+LAN_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")   # reachable only through the tunnel
+
+
+def ssh_port(st):
+    return int(st.get("ssh", {}).get("port") or 22)
+
+
+def ssh_extra(st):
+    return list(st.get("ssh", {}).get("extra") or [])
+
+
+def ssh_ready():
+    try:
+        return SSH_JUMP in open(NFT_CONF).read()
+    except OSError:
+        return False
+
+
+def ssh_sources(st):
+    """(VPN addresses, private networks through the tunnel, public addresses) allowed to SSH."""
+    vpn, private, public = panel_ips(st), [], []
+    for e in ssh_extra(st):
+        n = ipaddress.ip_network(e)
+        (private if any(n.subnet_of(ipaddress.ip_network(x)) for x in LAN_NETS) else public).append(e)
+    return vpn, private, public
+
+
+def render_ssh_nft(st):
+    port = ssh_port(st)
+    vpn, private, public = ssh_sources(st)
+    lines = [T("# Згенеровано wgctl. Не редагуйте вручну: зміни зітруться."), "table inet filter {", "\tchain wgctl_ssh {"]
+    if vpn or private:
+        lines.append(f'\t\tiifname "{IFACE}" ip saddr {{ {", ".join(vpn + private)} }} tcp dport {port} accept   # admin')
+    if public:
+        lines.append(f'\t\tip saddr {{ {", ".join(public)} }} tcp dport {port} accept   # extra')
+    lines += ["\t}", "}"]
+    return "\n".join(lines) + "\n"
+
+
+def ssh_client_ip():
+    """The address of the current SSH session, if wgctl runs inside one."""
+    v = os.environ.get("SSH_CONNECTION", "").split()
+    return v[0] if v else ""
+
+
+def ssh_allows(st, ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    vpn, private, public = ssh_sources(st)
+    return ip in vpn or any(a in ipaddress.ip_network(n) for n in private + public)
+
+
+def apply_ssh(st):
+    """Updates the wgctl_ssh chain. Does nothing before `wgctl ssh setup`.
+    An empty list would lock everyone out, so in that case the previous rules stay."""
+    if not ssh_ready():
+        return
+    vpn, private, public = ssh_sources(st)
+    if not (vpn or private or public):
+        print(T("Увага: SSH не дозволено жодному ключу, лишаю попередні правила. Дайте комусь доступ до панелі: wgctl set <ім'я> --admin on"),
+              file=sys.stderr)
+        return
+    new = render_ssh_nft(st)
+    old = open(SSH_NFT).read() if os.path.exists(SSH_NFT) else None
+    if new == old:
+        return
+    write_file(SSH_NFT, new, 0o644)
+    if not DRY:
+        body = new.split("\n", 1)[1]
+        r = run(["nft", "-f", "-"], f"flush chain inet filter wgctl_ssh\n{body}", check=False)
+        if r.returncode != 0:
+            if old is not None:
+                write_file(SSH_NFT, old, 0o644)
+            die(T("nftables не прийняв правила SSH: ") + r.stderr.strip())
+    log(T("EVENT:security Доступ SSH до хаба: {0}", ", ".join(sum(ssh_sources(st), []))))
+
+
+SSH_RULE_RE = r"^(\s*)(?:iifname\s+\S+\s+)?(?:ip\s+saddr\s+(?:\{[^}]*\}|\S+)\s+)?tcp\s+dport\s+PORT\s+accept\b.*$"
+
+
+def nft_conf_ssh(text, port):
+    """Replaces every rule that accepts the SSH port (open to all or a hand-written list) with a jump to
+    wgctl_ssh and adds the include. Returns the new text or None if no such rule was found."""
+    if SSH_JUMP in text:
+        return text
+    inc = f'include "{SSH_NFT[len(ROOT):] if ROOT else SSH_NFT}"'
+    rule = re.compile(SSH_RULE_RE.replace("PORT", str(port)))
+    out, inc_done, jump_done = [], False, False
+    for ln in text.splitlines():
+        if not inc_done and re.match(r"\s*table\s+inet\s+filter\s*\{", ln):
+            out += [T("# wgctl: SSH до хаба (ланцюг wgctl_ssh; файл оновлює wgctl)"), inc, ""]
+            inc_done = True
+        m = rule.match(ln)
+        if m:
+            if not jump_done:
+                out.append(T("{0}{1}        # wgctl: SSH лише для ключів з доступом до панелі", m.group(1), SSH_JUMP))
+                jump_done = True
+            continue
+        out.append(ln)
+    return "\n".join(out) + "\n" if inc_done and jump_done else None
+
+
+def nft_conf_ssh_off(text, port):
+    """Back to SSH open to everyone: the jump becomes a plain accept, the include goes away."""
+    out = []
+    for ln in text.splitlines():
+        if SSH_JUMP in ln:
+            ind = re.match(r"\s*", ln).group(0)
+            out.append(f"{ind}tcp dport {port} accept")
+        elif "wgctl-ssh.nft" in ln or "wgctl_ssh" in ln:
+            continue
+        else:
+            out.append(ln)
+    return "\n".join(out) + "\n"
+
+
+def nft_replace(text, new, backup, what):
+    """Checks, writes and loads a new nftables.conf; on failure brings back the previous one."""
+    if not DRY:
+        r = run(["nft", "-c", "-f", "-"], new, check=False)
+        if r.returncode != 0:
+            die(T("Перевірка nftables не пройшла, нічого не змінено: ") + r.stderr.strip())
+    shutil.copy2(NFT_CONF, NFT_CONF + backup)
+    write_file(NFT_CONF, new, 0o644)
+    if not DRY:
+        r = run(["nft", "-f", NFT_CONF], check=False)
+        if r.returncode != 0:
+            shutil.copy2(NFT_CONF + backup, NFT_CONF)
+            run(["nft", "-f", NFT_CONF], check=False)
+            die(T("nftables не прийняв нові правила, повернуто попередні: ") + r.stderr.strip())
+    log(f"EVENT:security {what}")
+
+
+def detect_ssh_port():
+    if DRY:
+        return 22
+    r = run(["sshd", "-T"], check=False)
+    m = re.search(r"^port (\d+)$", r.stdout or "", re.M)
+    return int(m.group(1)) if m else 22
+
+
+def show_diff(text, new):
+    import difflib
+    print(T("Зміни в {0}:\n", NFT_CONF))
+    sys.stdout.writelines(difflib.unified_diff(text.splitlines(True), new.splitlines(True), T("було"), T("стане")))
+
+
+def cmd_ssh_setup(a):
+    """One-time: SSH to the hub only from the panel list. Refuses if it would cut off the current session."""
+    need_tty(T("Обмеження SSH"))
+    with Lock():
+        st = load()
+        conf = st.setdefault("ssh", {})
+        conf["port"] = a.port or conf.get("port") or detect_ssh_port()
+        vpn, private, public = ssh_sources(st)
+        if not (vpn or private or public):
+            die(T("Жоден ключ не має доступу до панелі, SSH було б закрито для всіх. Спершу: wgctl set <ім'я> --admin on"))
+        me = ssh_client_ip()
+        if me and not ssh_allows(st, me) and not a.force:
+            die(T("Ви зараз підключені з {0}, а ця адреса не в списку: сесія обірветься. Підключіться через VPN "
+                  "або додайте адресу (wgctl ssh allow {0}). Нічого не змінено.", me))
+        text = open(NFT_CONF).read()
+        new = nft_conf_ssh(text, ssh_port(st))
+        if new is None:
+            die(T("Не знайшов у {0} правила 'tcp dport {1} accept'. Нічого не змінено.", NFT_CONF, ssh_port(st)))
+        print(T("SSH (порт {0}) буде дозволено лише з: {1}", ssh_port(st), ", ".join(vpn + private + public)))
+        print(T("Решта адрес, зокрема весь інтернет, отримають відмову. Тримайте під рукою консоль провайдера на випадок збою VPN."))
+        if new != text:
+            show_diff(text, new)
+            if not a.yes and input(T("Застосувати? Напишіть так: ")).strip().lower() != T("так"):
+                die(T("Скасовано, нічого не змінено"))
+        conf["enabled"] = True
+        save(st)
+        write_file(SSH_NFT, render_ssh_nft(st), 0o644)
+        if new != text:
+            nft_replace(text, new, ".before-wgctl-ssh", T("SSH до хаба лише для ключів з доступом до панелі"))
+    notify(T("SSH до хаба тепер лише для ключів з доступом до панелі"), "security", level="critical", icon="🔒")
+    print(T("Готово. Копія попереднього файлу: {0}.before-wgctl-ssh. Список оновлюється сам, коли змінюється доступ до панелі.", NFT_CONF))
+
+
+def cmd_ssh_off(a):
+    need_tty(T("Відкриття SSH"))
+    with Lock():
+        st = load()
+        text = open(NFT_CONF).read()
+        if SSH_JUMP not in text:
+            die(T("Обмеження SSH не ввімкнено"))
+        new = nft_conf_ssh_off(text, ssh_port(st))
+        show_diff(text, new)
+        if not a.yes and input(T("SSH стане відкритим для всього інтернету. Напишіть так: ")).strip().lower() != T("так"):
+            die(T("Скасовано, нічого не змінено"))
+        st.setdefault("ssh", {})["enabled"] = False
+        save(st)
+        nft_replace(text, new, ".before-wgctl-ssh-off", T("SSH до хаба відкрито для всіх"))
+    notify(T("SSH до хаба знову відкритий для всіх"), "security", level="critical", icon="🔓")
+    print(T("Готово: SSH відкритий для всіх, як після встановлення"))
+
+
+def cmd_ssh_allow(a, deny=False):
+    with Lock():
+        st = load()
+        conf = st.setdefault("ssh", {})
+        cur = ssh_extra(st)
+        for v in a.addr:
+            try:
+                n = str(ipaddress.ip_network(v, strict=False))
+            except ValueError:
+                die(T("Адреса або мережа, напр. 192.168.40.0/24 чи 203.0.113.5"))
+            if ipaddress.ip_network(n).version != 4 or ipaddress.ip_network(n).prefixlen < 8:
+                die(T("Занадто широка мережа: {0}", n))
+            n = n[:-3] if n.endswith("/32") else n
+            if deny:
+                cur = [x for x in cur if x != n]
+            elif n not in cur:
+                cur.append(n)
+        conf["extra"] = cur
+        me = ssh_client_ip()
+        if deny and ssh_ready() and me and not ssh_allows(st, me) and not a.force:
+            die(T("Ви зараз підключені з {0}: після цього сесія обірветься. Нічого не змінено.", me))
+        save(st)
+        apply_ssh(st)
+    log(T("EVENT:security {0} SSH для {1}", T("Забрано") if deny else T("Дозволено"), ", ".join(a.addr)))
+    print(T("Додаткові адреси для SSH: {0}", ", ".join(cur) or T("немає")))
+
+
+def cmd_ssh_show(a):
+    st = load()
+    keys = {c["ip"]: n for n, c in st["clients"].items()}
+    keys.update({l["ip"]: T("локація {0}", n) for n, l in st["locations"].items()})
+    vpn, private, public = ssh_sources(st)
+    if a.json:
+        print(json.dumps({"enabled": ssh_ready(), "port": ssh_port(st), "keys": [keys.get(i, i) for i in vpn],
+                          "extra": private + public}, ensure_ascii=False, indent=2))
+        return
+    print(T("Обмеження SSH:    {0}", T("увімкнено") if ssh_ready() else T("вимкнено (sudo wgctl ssh setup)")))
+    print(T("Порт:             {0}", ssh_port(st)))
+    print(T("Ключі (як панель): {0}", ", ".join(f"{keys.get(i, i)} {i}" for i in vpn) or T("немає")))
+    print(T("Додаткові адреси: {0}", ", ".join(private + public) or T("немає")))
 
 
 def parse_target(v):
@@ -4006,6 +4255,24 @@ def main():
     p = tc.add_parser("list", help=T("список сервісів"))
     p.add_argument("--json", action="store_true")
     p.set_defaults(f=cmd_tcp_list)
+
+    sh = sp.add_parser("ssh", help=T("SSH до хаба: лише ключі з доступом до панелі")).add_subparsers(dest="shcmd", required=True)
+    p = sh.add_parser("setup", help=T("увімкнути обмеження (разово, змінює nftables.conf)"))
+    p.add_argument("--port", type=int, help=T("порт SSH (типово з sshd -T)"))
+    p.add_argument("--force", action="store_true", help=T("навіть якщо поточна сесія обірветься"))
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(f=cmd_ssh_setup)
+    p = sh.add_parser("off", help=T("знову відкрити SSH для всіх"))
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(f=cmd_ssh_off)
+    for n, deny in (("allow", False), ("deny", True)):
+        p = sh.add_parser(n, help=T("додаткова адреса чи мережа (напр. домашня LAN через локацію)") if not deny else T("прибрати додаткову адресу"))
+        p.add_argument("addr", nargs="+")
+        p.add_argument("--force", action="store_true", help=T("навіть якщо поточна сесія обірветься"))
+        p.set_defaults(f=lambda a, d=deny: cmd_ssh_allow(a, d))
+    p = sh.add_parser("show", help=T("хто може підключатися по SSH"))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_ssh_show)
 
     p = sp.add_parser("visits", help=T("журнал відвідувань сайтів (підсумки за дні)"))
     p.add_argument("--site")

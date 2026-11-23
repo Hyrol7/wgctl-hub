@@ -66,10 +66,16 @@ done
 if grep -q 'wgctl' /etc/nftables.conf 2>/dev/null; then
   # the rules stay; only the per-key TCP service rules go (the include must keep a valid, empty chain)
   install -m 0644 "$SRC/templates/wgctl-tcp.nft.empty" /etc/nftables.d/wgctl-tcp.nft
+  if [ -e /etc/nftables.d/wgctl-ssh.nft ]; then
+    # SSH was limited to VPN admins; the VPN goes away, so open SSH again instead of locking everyone out
+    SSH_PORT=$(grep -o 'tcp dport [0-9]*' /etc/nftables.d/wgctl-ssh.nft | head -1 | awk '{print $3}')
+    printf 'table inet filter {\n\tchain wgctl_ssh {\n\t\ttcp dport %s accept\n\t}\n}\n' "${SSH_PORT:-22}" \
+      > /etc/nftables.d/wgctl-ssh.nft
+  fi
   nft -f /etc/nftables.conf || true
   echo "/etc/nftables.conf still has the wgctl rules (SSH, WireGuard and HTTPS only). Edit it if you need other ports."
 else
-  rm -f /etc/nftables.d/wgctl-tcp.nft
+  rm -f /etc/nftables.d/wgctl-tcp.nft /etc/nftables.d/wgctl-ssh.nft
 fi
 
 if [ "$PURGE" = 1 ]; then

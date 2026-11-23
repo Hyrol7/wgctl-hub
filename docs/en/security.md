@@ -30,8 +30,18 @@ The hub itself reaches home services only through Caddy (sites) or a TCP proxy (
 - Sessions: HttpOnly `__Host-` cookie, SameSite=Strict, 30-minute idle timeout, at most 10 sessions; password change ends all sessions.
 - CSRF token on every form plus an Origin/Sec-Fetch-Site check; strict CSP (no inline scripts), HSTS, COOP/CORP, `frame-ancestors 'none'`.
 - Only the last `X-Forwarded-For` value is trusted, and only from Caddy on 127.0.0.1.
-- Even a fully compromised panel stays limited: when `wgctl` runs through sudo from user `vpnadmin`, it accepts only the commands the panel uses. `init`, `backup restore/init/verify`, `tcp setup`, `location adopt`, `panel`, `cloudflare`, `render` and `geo update` work only from an SSH terminal.
+- Even a fully compromised panel stays limited: when `wgctl` runs through sudo from user `vpnadmin`, it accepts only the commands the panel uses. `init`, `backup restore/init/verify`, `tcp setup`, `ssh`, `location adopt`, `panel`, `cloudflare`, `render` and `geo update` work only from an SSH terminal.
 - After 20 failed logins from all addresses within 15 minutes the login is closed for everyone for 15 minutes. Only admin keys reach the panel, so this mostly protects against a stolen key; if it ever locks you out, wait or restart `vpnadmin` over SSH.
+
+## SSH to the hub
+
+After installation SSH on the VPS is open to the whole internet. `sudo wgctl ssh setup` (one-time) closes it and lets in only the addresses that may open the panel: keys with `--admin` and locations with `--panel on`. From then on the list follows itself: `wgctl set NAME --admin on|off` grants or removes both the panel and SSH.
+
+- `wgctl ssh show` shows who may connect now.
+- `wgctl ssh allow 192.168.40.0/24` adds an extra network. Private networks (a home LAN behind a location) are accepted only from the tunnel; a public address (a spare way in from a fixed IP) from any interface. `wgctl ssh deny` removes it.
+- `sudo wgctl ssh off` makes SSH open to everyone again.
+
+Lockout guards: `setup` refuses if no key has panel access or if the current SSH session comes from an address outside the list; `deny` will not remove the address you are connected from; if the last admin goes away, wgctl keeps the previous rules. Keep the VPS provider console at hand anyway.
 
 ## Monitoring
 
@@ -48,7 +58,7 @@ The hub itself reaches home services only through Caddy (sites) or a TCP proxy (
 
 ## Hardening checklist
 
-- SSH with keys only (`PasswordAuthentication no`), ideally from a few addresses.
+- SSH with keys only (`PasswordAuthentication no`) and only for admins: `sudo wgctl ssh setup`.
 - `unattended-upgrades` on; reboot when the Server page asks.
 - Keep the backup secret key and the TOTP secret in a password manager, not on the VPS.
 - Grant sites per key; use `*` (all sites) only for your own devices.
