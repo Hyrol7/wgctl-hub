@@ -30,13 +30,13 @@ def test_add_client_with_site_and_render(hub):
     hub.run("site", "add", "nas", "http://192.168.1.10:5000")
     hub.run("add", "phone", "--sites", "nas")
     st = hub.state()
-    assert st["clients"]["phone"]["ip"] == "10.77.0.10"
+    assert st["clients"]["phone"]["ip"] == "10.77.0.51", "a client gets the first address of the client range"
     conf = hub.read("/etc/wgctl/clients/phone.conf")
     assert "AllowedIPs = 10.77.0.1/32" in conf, "clients must reach only the hub, not the home network"
     assert "Endpoint = 198.51.100.7:51820" in conf
     caddy = hub.read("/etc/caddy/wgctl.caddy")
     assert "@site_nas host nas.example.org" in caddy
-    assert re.search(r"@allow_nas remote_ip 10\.77\.0\.10\b", caddy)
+    assert re.search(r"@allow_nas remote_ip 10\.77\.0\.51\b", caddy)
     wg = hub.read("/etc/wireguard/wg0.conf")
     assert "AllowedIPs = 10.77.0.2/32, 192.168.1.0/24" in wg or "192.168.1.0/24" in wg
 
@@ -46,14 +46,14 @@ def test_site_access_is_explicit(hub_en):
     hub_en.run("site", "add", "nas", "http://192.168.1.10:5000")
     hub_en.run("add", "tablet")
     caddy = hub_en.read("/etc/caddy/wgctl.caddy")
-    assert "10.77.0.10" not in caddy, "a new key gets no sites by default"
+    assert "10.77.0.51" not in caddy, "a new key gets no sites by default"
     hub_en.run("grant", "tablet", "nas")
-    assert "10.77.0.10" in hub_en.read("/etc/caddy/wgctl.caddy")
+    assert "10.77.0.51" in hub_en.read("/etc/caddy/wgctl.caddy")
     hub_en.run("deny", "tablet", "nas")
-    assert "10.77.0.10" not in hub_en.read("/etc/caddy/wgctl.caddy")
+    assert "10.77.0.51" not in hub_en.read("/etc/caddy/wgctl.caddy")
 
 
-@pytest.mark.parametrize("name", ["-x", "x-", "a" * 32, "ph one", "a_b", "a.b"])
+@pytest.mark.parametrize("name", ["-x", "x-", "_x", "x_", "a" * 32, "ph one", "a.b"])
 def test_bad_names_rejected(hub_en, name):
     assert hub_en.run("add", name, ok=False).returncode != 0
 
@@ -175,7 +175,7 @@ def test_public_site_log_skip(hub_en):
 def test_vpn_site_log_and_cf_headers(hub_en):
     hub_en.run("site", "add", "vpnhook", "http://127.0.0.1:8791")
     hub_en.run("site", "add", "plain", "http://127.0.0.1:8792")
-    hub_en.run("add", "laptop", "--sites", "*")
+    hub_en.run("add", "laptop", "--sites", "*", "--admin")
     caddy = hub_en.read("/etc/caddy/wgctl.caddy")
     assert "log_name" not in caddy, "without hide-path sites the config stays as before"
     assert "header_up -Cf-Connecting-Ip" in caddy and "header_up -True-Client-Ip" in caddy
@@ -272,7 +272,7 @@ def test_all_sites_key_can_lose_one_site(hub_en):
     hub_en.run("location", "add", "home", "--networks", "192.168.1.0/24")
     hub_en.run("site", "add", "nas", "http://192.168.1.10:5000")
     hub_en.run("site", "add", "cam", "http://192.168.1.11:80")
-    hub_en.run("add", "mac", "--sites", "*")
+    hub_en.run("add", "mac", "--sites", "*", "--admin")
     hub_en.run("deny", "mac", "cam")
     assert hub_en.state()["clients"]["mac"]["except"] == ["cam"]
     sites = {s["name"]: s["access"] for s in json.loads(hub_en.run("site", "list", "--json").stdout)}

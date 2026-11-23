@@ -103,6 +103,30 @@ TZ = ZoneInfo(cfg("general", "timezone", "UTC"))
 NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,29}[a-z0-9])?$")   # like a DNS label: no trailing hyphen
 NAME_PATTERN = r"[a-z0-9](?:[a-z0-9\-]{0,29}[a-z0-9])?"            # the same for the browser (pattern attribute)
 NAME_HINT = T("Латиниця a-z, цифри, дефіс; до 31 символу, без дефіса на початку і в кінці. Великі літери стануть малими.")
+KEY_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,29}[a-z0-9])?$")    # key names: as in wgctl, "_" allowed too
+KEY_PATTERN = r"[a-z0-9](?:[a-z0-9_\-]{0,29}[a-z0-9])?"
+KEY_HINT = T("Латиниця a-z, цифри, дефіс і _; до 31 символу, без них на початку і в кінці. Великі літери стануть малими.")
+ROLE_NAME = {"admin": T("адмін"), "server": T("сервер"), "client": T("клієнт")}
+ROLE_ORDER = {"admin": 0, "server": 1, "client": 2}
+
+
+def _role_ips():
+    """Address ranges of the key roles, as wgctl computes them from config.toml."""
+    lo, hi = int(cfg("network", "clients_from", 10)), int(cfg("network", "clients_to", 250))
+    dflt = {"admin": (lo, lo + 9), "server": (lo + 10, lo + 40), "client": (lo + 41, hi)}
+    out = {}
+    for r, (a, b) in dflt.items():
+        m = re.fullmatch(r"\s*(\d{1,3})\s*-\s*(\d{1,3})\s*", str(cfg("roles", r, f"{a}-{b}")))
+        out[r] = (int(m.group(1)), int(m.group(2))) if m else (a, b)
+    return out
+
+
+ROLE_IPS = _role_ips()
+
+
+def role_span(r):
+    lo, hi = ROLE_IPS[r]
+    return f"{NET}{lo}–{hi}"
 
 
 # ---- credentials ------------------------------------------------------------
@@ -334,6 +358,11 @@ def prefetch(*calls):
 def norm_name(v):
     """HP-PC my_work -> hp-pc-my-work: the same as the JS in the form does."""
     return re.sub(r"[\s_.]+", "-", str(v).strip().lower())
+
+
+def norm_key(v):
+    """Key names keep "_" (wgctl allows it): "My PC_2" -> my-pc_2."""
+    return re.sub(r"[\s.]+", "-", str(v).strip().lower())
 
 
 def opt(name, value):
@@ -600,7 +629,7 @@ class H(http.server.BaseHTTPRequestHandler):
             else:
                 f = {}
             # names as in wgctl: start with a letter or digit, so "/c/--admin" never becomes a wgctl option
-            m = re.fullmatch(rf"/c/({NAME_PATTERN})(/conf)?", path)
+            m = re.fullmatch(rf"/c/({KEY_PATTERN})(/conf)?", path)
             ms = re.fullmatch(rf"/s/({NAME_PATTERN})", path)
             mt = re.fullmatch(rf"/t/({NAME_PATTERN})", path)
             ml = re.fullmatch(rf"/l/({NAME_PATTERN})(/conf)?", path)
@@ -857,7 +886,8 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             ring = self.ring(num, 1)
             days = T("до {0}", c['expires']) if c.get("expires") else T("без автовідкликання")
-        meta = c.get("note") or (T("адмін") if c.get("admin") else "")
+        role = ROLE_NAME.get(c.get("role"), "")
+        meta = role + (f" · {c['note']}" if c.get("note") else "")
         why = f'<p class="why">{e(c["suspect"])}</p>' if c.get("suspect") and c["status"] != "revoked" else ""
         return (f'<a class="k key {cls}" href="/c/{c["name"]}"><div class="top">{ring}'
                 f'<div class="lf"><span>{e(c["ip"])}</span><span>{e(days)}</span></div></div>'
@@ -1251,7 +1281,8 @@ class H(http.server.BaseHTTPRequestHandler):
             boxes.append(bx)
             lab = (f'<text class="dn" x="{tx:.0f}" y="{ty:.0f}" text-anchor="{anc}">{e(name)}</text>'
                    if labels or cls in ("bad", "warn") else "")
-            g = [f'<a href="/c/{d["name"]}"><title>{e(d["name"])}</title>{halo}<circle class="dt dv {cls}" cx="{x:.0f}" cy="{y:.0f}" r="9"/>{lab}</a>']
+            role = d.get("role", "client")
+            g = [f'<a href="/c/{d["name"]}"><title>{e(d["name"] + " · " + ROLE_NAME.get(role, role))}</title>{halo}<circle class="dt dv {cls} r-{role}" cx="{x:.0f}" cy="{y:.0f}" r="9"/>{lab}</a>']
             # sites living on a device: a second line under the name
             if sub and lab:
                 bad = any(it["ok"] is False for it in d["sites"])
@@ -1259,6 +1290,13 @@ class H(http.server.BaseHTTPRequestHandler):
             out.append("".join(g))
         on = sum(d["online"] for d in devs)
         out.append(T("<text class=\"ol\" x=\"{0}\" y=\"{1}\" text-anchor=\"middle\">зовнішня орбіта: пристрої з ключами, {2}, онлайн {3}</text>", hx, hy + ORY + 40, n, on))
+        roles = [r for r in ROLE_ORDER if any(d.get("role") == r for d in devs)]
+        lx = 24
+        for r in roles:                                       # legend: the ring colour of a device is its role
+            k = sum(d.get("role") == r for d in devs)
+            out.append(f'<circle class="dt dv idle r-{r}" cx="{lx + 9}" cy="{H - 22}" r="7"/>'
+                       f'<text class="ol" x="{lx + 24}" y="{H - 17}">{e(ROLE_NAME[r])} · {k}</text>')
+            lx += 24 + (len(ROLE_NAME[r]) + 5) * 8
         ok = st["wg0"] == "ok" and st["caddy"] == "ok"
         out.append(T("<circle class=\"hubr\" cx=\"{0}\" cy=\"{1}\" r=\"64\"/><circle class=\"hubc\" cx=\"{2}\" cy=\"{3}\" r=\"52\"/><text class=\"ht\" x=\"{4}\" y=\"{5}\" text-anchor=\"middle\">VPS хаб</text><text class=\"hs\" x=\"{6}\" y=\"{7}\" text-anchor=\"middle\">{8}</text>", hx, hy, hx, hy, hx, hy + 2, hx, hy + 20, T("wg0 і Caddy") if ok else T("є збій")))
         out.append("</svg>")
@@ -1278,6 +1316,11 @@ class H(http.server.BaseHTTPRequestHandler):
         cls = "warn" if att else ("ok" if on else "off")
         mm = "".join(T("<a class=\"mm {0}{1}\" href=\"{2}\">{3} на {4}</a>", self.item_cls(it), " svc" if it.get("svc") else "", item_href(it), e(it["name"]), e(d["name"])) for d, it in hosted)
         rows.append(T("<div class=\"sy {0}\"><span class=\"dot\"></span><div><b>Пристрої · {1}</b><small>онлайн {2}", cls, len(devs), on) + (T(", увага {0}", att) if att else "") + f'</small><div class="mms">{mm}</div></div></div>')
+        for r in ROLE_ORDER:
+            ds = [d for d in devs if d.get("role") == r]
+            if ds:
+                mm = "".join(f'<a class="mm {"ok" if d["online"] else "idle"}" href="/c/{d["name"]}">{e(d["name"])}</a>' for d in ds)
+                rows.append(f'<div class="sy r-{r}"><span class="dot"></span><div><b>{e(ROLE_NAME[r].capitalize())} · {len(ds)}</b><div class="mms">{mm}</div></div></div>')
         return "".join(rows)
 
     # -- overview
@@ -1314,9 +1357,12 @@ class H(http.server.BaseHTTPRequestHandler):
         groups = {"": live, "online": [c for c in live if c["online"]],
                   "attn": [c for c in live if self.client_state(c)[0] in ("bad", "warn")],
                   "off": [c for c in live if c["status"] == "disabled"]}
+        for r in ROLE_ORDER:
+            groups[r] = [c for c in live if c.get("role") == r]
         flt = flt if flt in groups else ""
         fl = "".join(f'<a class="{"on" if flt == k else ""}" href="/{"?f=" + k if k else ""}">{t} {len(groups[k])}</a>'
-                     for k, t in (("", T("Усі")), ("online", T("Онлайн")), ("attn", T("Увага")), ("off", T("Вимкнені"))))
+                     for k, t in (("", T("Усі")), ("online", T("Онлайн")), ("attn", T("Увага")), ("off", T("Вимкнені")),
+                                  ("admin", T("Адміни")), ("server", T("Сервери")), ("client", T("Клієнти"))))
         cards = "".join(self.key_card(c) for c in groups[flt])
         if not flt:
             cards += T("<a class=\"k new\" href=\"/new\">+ Видати ключ</a>")
@@ -1360,6 +1406,16 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.act(s, args, T("Збережено"))
             elif a == "sites":
                 self.act(s, ["set", name, "--sites", self.sites_value(f)], T("Права на сайти збережено"))
+            elif a == "role" and f.get("role") in ("client", "server"):
+                self.act(s, ["set", name, "--role", f["role"]], T("Роль змінено"))
+            elif a == "move":
+                self.act(s, ["move", name], "")
+            elif a == "rename":
+                new = norm_key(f.get("new", ""))
+                if not KEY_RE.match(new):
+                    self.flash(s, "bad", T("Ім'я: ") + KEY_HINT[0].lower() + KEY_HINT[1:])
+                elif self.act(s, ["rename", name, new], T("Ключ перейменовано, на пристрої нічого міняти не треба")):
+                    raise Redirect(f"/c/{new}")
             elif a == "guest_end":
                 try:
                     is_guest = wgj("show", name).get("guest")
@@ -1413,7 +1469,7 @@ class H(http.server.BaseHTTPRequestHandler):
             acts += self.bform(s, "reissue", T("Перевидати конфіг"), "b", T("Старий конфіг перестане працювати. Продовжити?"))
         ar = (T("через {0} дн", c['autorevoke_in_days']) if c.get("autorevoke_in_days") is not None
               else (T("вимкнено") if not c.get("autorevoke") else "-"))
-        facts = [(c["ip"], T("адреса у VPN")), (ago(c["last_seen"]) if c["last_seen"] else T("ніколи"), T("останнє підключення")),
+        facts = [(c["ip"], T("адреса · {0}", ROLE_NAME.get(c.get("role"), ""))), (ago(c["last_seen"]) if c["last_seen"] else T("ніколи"), T("останнє підключення")),
                  (place_, T("звідки")), (c.get("expires") or ar, T("термін дії") if c.get("expires") else T("автовідкликання"))]
         if c.get("guest"):
             facts[3] = (hm(c["guest_left"]), T("до кінця доступу"))
@@ -1463,12 +1519,31 @@ class H(http.server.BaseHTTPRequestHandler):
             parts.append(T("<section><h2>Історія адрес</h2><div class=\"lines\">{0}</div></section>", rows))
         parts.append(T("<section><h2>Події <a href=\"/log?client={0}\">усі</a></h2>{1}</section>", name, self.events(log)))
         if live and not c.get("guest"):
+            parts.append(self.role_block(s, name, c, cs))
+        if live and not c.get("guest"):
             adm = "admin_off" if c.get("admin") else "admin_on"
             parts.append(T("<section><h2>Небезпечні дії</h2><div class=\"panel\"><p class=\"pstat {5}\">{6}</p><p class=\"muted small\">Потрібен код із застосунку.</p>\n<form method=\"post\" class=\"row\">{0}{1}\n<button class=\"btn\" name=\"act\" value=\"{2}\">{3}</button>\n<button class=\"btn danger\" name=\"act\" value=\"revoke\" data-confirm=\"Відкликати {4} назавжди? Конфіг перестане працювати.\">Відкликати назавжди</button></form></div></section>", cs, self.code_field('cd'), adm, T("Забрати доступ до панелі") if c.get('admin') else T("Дати доступ до панелі"), e(name),
                            "on" if c.get("admin") else "off",
                            T("Доступ до панелі: є. Цей пристрій може відкривати панель.") if c.get("admin") else
                            T("Доступ до панелі: немає.")))
         return self.layout(s, name, hero, "".join(parts), "home", state)
+
+    def role_block(self, s, name, c, cs):
+        """Role, address range, moving into the range and renaming."""
+        role = c.get("role", "client")
+        lead = T("Роль: {0}. Адреса {1}, діапазон ролі {2}.", ROLE_NAME.get(role, role), c["ip"], role_span(role))
+        out = [f'<p>{e(lead)}</p>']
+        if not c.get("role_ok", True):
+            out.append(T("<div class=\"note warn\">Адреса поза діапазоном ролі. Після перенесення змініть на пристрої в конфігу рядок Address (або імпортуйте конфіг заново); доти пристрій без зв'язку. Сайти на ньому переїдуть самі.<div class=\"acts\">{0}</div></div>",
+                         self.bform(s, "move", T("Перенести на адресу ролі"), "btn pri", T("Пристрій буде без зв'язку, доки на ньому не змінять Address. Продовжити?"))))
+        if role == "admin":
+            out.append(T("<p class=\"muted small\">Щоб зробити ключ клієнтом чи сервером, заберіть доступ до панелі нижче.</p>"))
+        else:
+            opts = "".join(f'<label class="tog"><input type="radio" name="role" value="{r}"{" checked" if r == role else ""}><span>{e(ROLE_NAME[r])}</span></label>'
+                           for r in ("client", "server"))
+            out.append(T("<form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"role\"><div class=\"togs\">{1}</div><button class=\"btn\">Змінити роль</button></form>", cs, opts))
+        out.append(T("<form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"rename\"><input type=\"text\" name=\"new\" required data-key maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{1}\" title=\"{2}\" placeholder=\"нове ім'я\" aria-label=\"Нове ім'я\"><button class=\"btn\">Перейменувати</button></form><p class=\"muted small\">Ключі й адреса лишаються, на пристрої нічого міняти не треба.</p>", cs, KEY_PATTERN, e(KEY_HINT)))
+        return T("<section><h2>Роль і назва</h2><div class=\"panel\">{0}</div></section>", "".join(out))
 
     @staticmethod
     def conf_grace(s, name, c):
@@ -1644,7 +1719,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def page_new(self, s, method, f):
         err = ""
         if method == "POST":
-            name = norm_name(f.get("name", ""))
+            name = norm_key(f.get("name", ""))
             args = ["add", name, opt("note", f.get("note", "")), "--sites", self.sites_value(f)]
             if f.get("phone"):
                 args.append(opt("phone", f["phone"]))
@@ -1663,13 +1738,15 @@ class H(http.server.BaseHTTPRequestHandler):
                     args.append(opt("expires", f["expires"]))
                 if not f.get("autorevoke"):
                     args.append("--no-autorevoke")
-            if f.get("admin") and not guest:
+            if f.get("role") == "admin" and not guest:
                 if self.need_code(s, f):
                     args.append("--admin")
                 else:
                     ok, err = False, T("Щоб дати доступ до панелі, потрібен правильний код із застосунку")
-            if ok and not NAME_RE.match(name):
-                ok, err = False, T("Ім'я: ") + NAME_HINT[0].lower() + NAME_HINT[1:]
+            elif f.get("role") == "server" and not guest:
+                args += ["--role", "server"]
+            if ok and not KEY_RE.match(name):
+                ok, err = False, T("Ім'я: ") + KEY_HINT[0].lower() + KEY_HINT[1:]
             if ok:
                 rc, out, werr = wg(*args)
                 if rc == 0:
@@ -1681,7 +1758,8 @@ class H(http.server.BaseHTTPRequestHandler):
         sites = wgj("site", "list")
         g = lambda k: e(str(f.get(k, "")))
         hero = self.hero(T("Новий ключ"), T("Ключ видається одному пристрою. Після створення відкриється сторінка ключа: звідти завантажте файл або покажіть QR."), small=True)
-        body = T("{0}<form method=\"post\">{1}\n<section><h2>Тип доступу</h2><div class=\"kinds\">\n<label class=\"kind\"><input type=\"radio\" name=\"kind\" value=\"perm\" id=\"k-perm\"{2}><span><b>Постійний ключ</b>\n<small>Для своїх пристроїв. Відкликається сам, якщо пристрій не підключався 60 днів.</small></span></label>\n<label class=\"kind\"><input type=\"radio\" name=\"kind\" value=\"guest\" id=\"k-guest\"{3}><span><b>Гостьовий на кілька годин</b>\n<small>Для гостя чи разового доступу. Після кінця строку ключ відкличеться сам.</small></span></label></div>\n<div class=\"hours togs\">{4}</div>\n</section>\n<section><h2>Пристрій</h2><div class=\"panel\"><div class=\"g2\">\n<div><label class=\"f\" for=\"nm\">Ім'я пристрою, напр. iphone-olena</label><input type=\"text\" id=\"nm\" name=\"name\" required data-name maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{5}\" title=\"{6}\" value=\"{7}\"><p class=\"hint\">{8}</p></div>\n<div><label class=\"f\" for=\"n\">Примітка</label><input type=\"text\" id=\"n\" name=\"note\" maxlength=\"80\" value=\"{9}\"></div>\n<div><label class=\"f\" for=\"ph\">Телефон для сповіщень (необов'язково)</label><input type=\"tel\" id=\"ph\" name=\"phone\" placeholder=\"+380671234567\" value=\"{10}\"></div>\n<div class=\"perm\"><label class=\"f\" for=\"ex\">Термін дії (необов'язково)</label><input type=\"date\" id=\"ex\" name=\"expires\" value=\"{11}\"></div></div>\n<label class=\"check perm\"><input type=\"checkbox\" name=\"autorevoke\" value=\"1\" checked>Автовідкликання після 60 дн без підключень</label></div></section>\n<section><h2>Сайти</h2><div class=\"panel\">{12}</div></section>\n<section class=\"perm\"><h2>Панель</h2><div class=\"panel\"><label class=\"check\"><input type=\"checkbox\" name=\"admin\" value=\"1\">Дати доступ до цієї панелі</label>\n<div class=\"row\">{13}</div></div></section>\n<div class=\"row\"><button class=\"btn pri\">Видати ключ</button><a class=\"btn\" href=\"/\">Скасувати</a></div></form>", f'<div class="note bad">{e(err)}</div>' if err else '', self.csrf(s), '' if f.get('kind') == 'guest' else ' checked', ' checked' if f.get('kind') == 'guest' else '', ''.join(T("<label class=\"tog\"><input type=\"radio\" name=\"hours\" value=\"{0}\"{1}><span>{2} год</span></label>", h, " checked" if str(h) == str(f.get("hours", "4")) else "", h) for h in GUEST_HOURS), NAME_PATTERN, NAME_HINT, g('name'), NAME_HINT, g('note'), g('phone'), g('expires'), self.toggles(sites, []), self.code_field('cd', label=T("Код із застосунку (лише для доступу до панелі)")))
+        body = T("{0}<form method=\"post\">{1}\n<section><h2>Тип доступу</h2><div class=\"kinds\">\n<label class=\"kind\"><input type=\"radio\" name=\"kind\" value=\"perm\" id=\"k-perm\"{2}><span><b>Постійний ключ</b>\n<small>Для своїх пристроїв. Відкликається сам, якщо пристрій не підключався 60 днів.</small></span></label>\n<label class=\"kind\"><input type=\"radio\" name=\"kind\" value=\"guest\" id=\"k-guest\"{3}><span><b>Гостьовий на кілька годин</b>\n<small>Для гостя чи разового доступу. Після кінця строку ключ відкличеться сам.</small></span></label></div>\n<div class=\"hours togs\">{4}</div>\n</section>\n<section><h2>Пристрій</h2><div class=\"panel\"><div class=\"g2\">\n<div><label class=\"f\" for=\"nm\">Ім'я пристрою, напр. iphone-olena</label><input type=\"text\" id=\"nm\" name=\"name\" required data-key maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{5}\" title=\"{6}\" value=\"{7}\"><p class=\"hint\">{8}</p></div>\n<div><label class=\"f\" for=\"n\">Примітка</label><input type=\"text\" id=\"n\" name=\"note\" maxlength=\"80\" value=\"{9}\"></div>\n<div><label class=\"f\" for=\"ph\">Телефон для сповіщень (необов'язково)</label><input type=\"tel\" id=\"ph\" name=\"phone\" placeholder=\"+380671234567\" value=\"{10}\"></div>\n<div class=\"perm\"><label class=\"f\" for=\"ex\">Термін дії (необов'язково)</label><input type=\"date\" id=\"ex\" name=\"expires\" value=\"{11}\"></div></div>\n<label class=\"check perm\"><input type=\"checkbox\" name=\"autorevoke\" value=\"1\" checked>Автовідкликання після 60 дн без підключень</label></div></section>\n<section><h2>Сайти</h2><div class=\"panel\">{12}</div></section>\n<section class=\"perm\"><h2>Роль</h2><div class=\"panel\"><div class=\"kinds\"><label class=\"kind\"><input type=\"radio\" name=\"role\" value=\"client\"{14}><span><b>Клієнт</b><small>Людина чи чужий комп'ютер: лише вибрані сайти. Адреса {15}.</small></span></label><label class=\"kind\"><input type=\"radio\" name=\"role\" value=\"server\"{16}><span><b>Сервер</b><small>Пристрій, на якому працюють сайти. Без автовідкликання. Адреса {17}.</small></span></label><label class=\"kind\"><input type=\"radio\" name=\"role\" value=\"admin\"{18}><span><b>Адмін</b><small>Ваш пристрій: панель, SSH до VPS, можна «усі сайти». Адреса {19}.</small></span></label></div>\n<div class=\"row\">{13}</div></div></section>\n<div class=\"row\"><button class=\"btn pri\">Видати ключ</button><a class=\"btn\" href=\"/\">Скасувати</a></div></form>", f'<div class="note bad">{e(err)}</div>' if err else '', self.csrf(s), '' if f.get('kind') == 'guest' else ' checked', ' checked' if f.get('kind') == 'guest' else '', ''.join(T("<label class=\"tog\"><input type=\"radio\" name=\"hours\" value=\"{0}\"{1}><span>{2} год</span></label>", h, " checked" if str(h) == str(f.get("hours", "4")) else "", h) for h in GUEST_HOURS), KEY_PATTERN, KEY_HINT, g('name'), KEY_HINT, g('note'), g('phone'), g('expires'), self.toggles(sites, []), self.code_field('cd', label=T("Код із застосунку (лише для ролі адмін)")),
+                 *[x for r in ("client", "server", "admin") for x in (" checked" if f.get("role", "client") == r else "", role_span(r))])
         return self.layout(s, T("Новий ключ"), hero, body, "home", self.sys_state()[0])
 
     # -- sites
@@ -1763,7 +1841,7 @@ class H(http.server.BaseHTTPRequestHandler):
             if a == "access":
                 want = f.get("who", [])
                 want = {want} if isinstance(want, str) else set(want)
-                cand = [w for w in f.get("cand", "").split(",") if NAME_RE.match(w)]
+                cand = [w for w in f.get("cand", "").split(",") if KEY_RE.match(w)]
                 add = sorted(w for w in cand if w in want and w not in sv["allow"])
                 rem = sorted(w for w in cand if w not in want and w in sv["allow"])
                 if add:
@@ -1819,7 +1897,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 want = f.get("who", [])
                 want = {want} if isinstance(want, str) else set(want)
                 for who in f.get("cand", "").split(","):
-                    if not NAME_RE.match(who):
+                    if not KEY_RE.match(who):
                         continue
                     has = who in site["access"]
                     if who in want and not has:
@@ -1924,7 +2002,7 @@ class H(http.server.BaseHTTPRequestHandler):
     # -- log
     def page_log(self, s, client, cat=""):
         args = ["log", "-n", "300"]
-        if client and NAME_RE.match(client):
+        if client and KEY_RE.match(client):
             args += ["--client", client]
         else:
             client = ""

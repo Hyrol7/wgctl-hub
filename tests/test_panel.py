@@ -121,7 +121,7 @@ def test_negative_content_length(panel):
 
 def test_pages_render_in_english(panel):
     c, _ = logged_in(panel)
-    for p in ("/", "/?f=online", "/sites", "/s/nas", "/c/phone", "/new", "/log", "/log?cat=security",
+    for p in ("/", "/?f=online", "/?f=server", "/sites", "/s/nas", "/c/phone", "/new", "/log", "/log?cat=security",
               "/server", "/settings", "/locations", "/l/home"):
         st, _, t, _ = c.req("GET", p)
         assert st == 200 and "<footer>" in t and "Traceback" not in t, p
@@ -207,7 +207,7 @@ def test_login_is_password_and_code_only(panel):
 
 
 def test_site_page_can_close_site_for_all_sites_key(panel):
-    panel.hub.run("add", "mac", "--sites", "*")
+    panel.hub.run("add", "mac", "--sites", "*", "--admin")
     c, tok = logged_in(panel)
     st, _, t, _ = c.req("GET", "/s/nas")
     assert 'value="mac" checked' in t and 'value="mac" checked disabled' not in t
@@ -216,3 +216,37 @@ def test_site_page_can_close_site_for_all_sites_key(panel):
     c.req("POST", "/s/nas", {"csrf": tok, "act": "access", "cand": cand, "who": ["phone"]})
     assert panel.hub.state()["clients"]["mac"]["except"] == ["nas"]
     assert panel.hub.state()["clients"]["phone"]["sites"] == ["nas"]
+
+
+def test_roles_in_panel(panel):
+    c, tok = logged_in(panel)
+    st, loc, _, _ = c.req("POST", "/new", {"csrf": tok, "name": "pi_4b", "kind": "perm", "role": "server", "autorevoke": "1"})
+    assert loc == "/c/pi_4b"
+    cl = panel.hub.state()["clients"]["pi_4b"]
+    assert (cl["role"], cl["ip"], cl["admin"]) == ("server", "10.77.0.20", False)
+    _, _, t, _ = c.req("GET", "/c/pi_4b")
+    assert "Role and name" in t and "10.77.0.20" in t
+    _, _, t, _ = c.req("GET", "/?f=server")
+    keys = t.split('<div class="keys">', 1)[1]
+    assert 'href="/c/pi_4b"' in keys and 'href="/c/phone"' not in keys
+    _, _, t, _ = c.req("GET", "/")
+    assert "r-server" in t and "r-admin" in t, "device rings are coloured by role"
+    c.req("POST", "/c/pi_4b", {"csrf": tok, "act": "role", "role": "client"})
+    assert panel.hub.state()["clients"]["pi_4b"]["role"] == "client"
+    _, _, t, _ = c.req("GET", "/c/pi_4b")
+    assert "Move to the role" in t, "10.77.0.20 is outside the client range"
+    c.req("POST", "/c/pi_4b", {"csrf": tok, "act": "move"})
+    assert panel.hub.state()["clients"]["pi_4b"]["ip"] == "10.77.0.51"
+    _, loc, _, _ = c.req("POST", "/c/pi_4b", {"csrf": tok, "act": "rename", "new": "Pi-Bot"})
+    assert loc == "/c/pi-bot" and "pi-bot" in panel.hub.state()["clients"]
+    c.req("POST", "/c/pi-bot", {"csrf": tok, "act": "role", "role": "admin"})
+    assert panel.hub.state()["clients"]["pi-bot"]["role"] == "client", "admin only through the code-protected button"
+
+
+def test_underscore_key_on_site_and_log_pages(panel):
+    panel.hub.run("add", "macbook_m2")
+    c, tok = logged_in(panel)
+    c.req("POST", "/s/nas", {"csrf": tok, "act": "access", "cand": "phone,macbook_m2", "who": ["phone", "macbook_m2"]})
+    assert "nas" in panel.hub.state()["clients"]["macbook_m2"]["sites"]
+    st, _, t, _ = c.req("GET", "/log?client=macbook_m2")
+    assert st == 200 and "Traceback" not in t

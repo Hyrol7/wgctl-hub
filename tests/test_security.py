@@ -39,8 +39,8 @@ def test_backend_accepted(home, backend):
 
 
 def test_backend_on_a_key_device(home):
-    home.run("add", "laptop")
-    home.run("site", "add", "dev", "http://10.77.0.10:8080")
+    home.run("add", "laptop", "--role", "server")
+    home.run("site", "add", "dev", "http://10.77.0.20:8080")
 
 
 # --- guest keys never get the panel, also through `set` -----------------------------------------

@@ -4,11 +4,22 @@ Everything can be done in the panel (`https://vpnadmin.<domain>`, admin keys onl
 
 ## Keys
 
-A key is one WireGuard config for one device. Names: lowercase Latin letters, digits and hyphens, up to 31 characters (`iphone-olena`, `work-laptop`).
+A key is one WireGuard config for one device. Names: lowercase Latin letters, digits, hyphens and `_`, up to 31 characters (`iphone-olena`, `macbook_m2`).
+
+**Roles.** Every key has a role, and the role decides its address:
+
+| Role | Addresses (default) | For |
+|---|---|---|
+| `admin` | `.10–.19` | your own devices: the panel, SSH to the VPS (`wgctl ssh`), may have `*` (all sites) |
+| `server` | `.20–.50` | a device that hosts sites; no auto-revoke |
+| `client` | `.51–.250` | a person or someone else's computer, guests; an explicit site list only |
+
+The `[roles]` section of `config.toml` sets the ranges (`admin = "10-19"` and so on). A new key gets the first free address of its range. The panel shows the role on the key card, in the Overview filters and as the ring colour on the map. Keys created before roles get one automatically: admin if they had panel access, server if a site or TCP service lives on them, client otherwise.
 
 ```bash
 sudo wgctl add iphone-olena --sites nas,photos --phone +15551234567 --qr
-sudo wgctl add work-laptop --sites '*'            # all sites, including future ones
+sudo wgctl add macbook_m2 --admin --sites '*'     # admin: all sites, including future ones
+sudo wgctl add pi-bot --role server              # server: address from .20–.50
 sudo wgctl add anna --hours 4 --sites photos     # guest key, revoked automatically in 4 h
 sudo wgctl list                                  # --all also shows revoked keys
 sudo wgctl show iphone-olena
@@ -24,7 +35,10 @@ sudo wgctl show iphone-olena
 | `wgctl disable NAME` / `enable` | temporarily off; the device sees an "Access disabled" page |
 | `wgctl reissue NAME` | new keys; the old config stops working (key rotation) |
 | `wgctl revoke NAME` | permanently remove the key |
-| `wgctl set NAME --admin on` | the key may open the panel (permanent keys only) |
+| `wgctl set NAME --admin on` | the key may open the panel (permanent keys only); the same as the admin role |
+| `wgctl set NAME --role server` | change the role (the address stays; if the key has `*`, add `--sites …`) |
+| `wgctl move NAME [--ip N]` | a new address in the role's range; sites and TCP services on the device move along. The device needs the new `Address` line in its config |
+| `wgctl rename NAME NEW` | rename; keys, address and config stay, nothing changes on the device |
 
 **Auto-revoke.** A key that has not connected for 60 days (`policy.inactive_days`) is revoked; the user and admins get a warning 7 days before. Turn it off per key with `--no-autorevoke` or `--autorevoke off`.
 
