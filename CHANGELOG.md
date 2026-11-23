@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - Key roles: `admin` (panel, SSH, may have all sites), `server` (hosts sites, no auto-revoke) and `client` (explicit sites only, guests). Each role has its own address range, by default `.10–.19`, `.20–.50` and `.51–.250` (`[roles]` in `config.toml`); new keys get an address from their range. `wgctl add/set --role`; `--admin` is the admin role. `*` (all sites) is now for admin keys only. Existing keys get a role automatically.
 - `wgctl move NAME [--ip N]`: a new address in the role's range; sites and TCP services hosted on the device follow it.

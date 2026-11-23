@@ -31,7 +31,7 @@ import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 
 def _load_config():
