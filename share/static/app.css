@@ -94,6 +94,7 @@ input:user-invalid,textarea:user-invalid{border-color:var(--bad)}
 .pl.off{stroke:var(--off);stroke-dasharray:5 6}
 .dt{fill:var(--idle)}.dt.ok{fill:var(--ok)}.dt.warn{fill:var(--warn)}.dt.bad{fill:var(--bad)}.dt.off{fill:var(--off)}.dt.idle{fill:var(--idle)}
 .halo{opacity:.18}.dv{stroke:var(--card);stroke-width:3}
+.dv.r-admin{stroke:var(--hub)}.dv.r-server{stroke:var(--c2)}.dv.r-client{stroke:var(--card)}.sy.r-admin .dot{border-color:var(--hub)}.sy.r-admin .dot::after{background:var(--hub)}.sy.r-server .dot{border-color:var(--c2)}.sy.r-server .dot::after{background:var(--c2)}
 .pt{font:600 15px Onest,sans-serif;fill:var(--ink)}.ps{font:400 12.5px Onest,sans-serif;fill:var(--soft)}
 .mn{font:600 13.5px Onest,sans-serif;fill:var(--ink)}.mi{font-weight:400;fill:var(--soft)}
 .dn{font:600 14px Onest,sans-serif;fill:var(--ink)}.mi.bad{fill:var(--bad)}text.mi{font:400 12.5px Onest,sans-serif;fill:var(--soft)}.ol{font:500 13px Onest,sans-serif;fill:var(--soft)}

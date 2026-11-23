@@ -126,6 +126,22 @@ HUB_IP = NET + "1"
 LOC_MIN = int(cfg("network", "locations_from", 2))     # addresses for locations (routers)
 LOC_MAX = int(cfg("network", "locations_to", 9))
 IP_MIN, IP_MAX = int(cfg("network", "clients_from", 10)), int(cfg("network", "clients_to", 250))
+# Key roles and their address ranges inside clients_from..clients_to: admin = your own devices (panel, SSH, all sites),
+# server = a device that hosts sites, client = a person or someone else's computer (explicit sites only, guests too).
+ROLES = ("admin", "server", "client")
+
+
+def _role_ranges():
+    dflt = {"admin": (IP_MIN, IP_MIN + 9), "server": (IP_MIN + 10, IP_MIN + 40), "client": (IP_MIN + 41, IP_MAX)}
+    out = {}
+    for r in ROLES:
+        v = str(cfg("roles", r, f"{dflt[r][0]}-{dflt[r][1]}"))
+        m = re.fullmatch(r"\s*(\d{1,3})\s*-\s*(\d{1,3})\s*", v)
+        out[r] = (int(m.group(1)), int(m.group(2))) if m else (0, -1)
+    return out
+
+
+ROLE_IPS = _role_ranges()
 CF_API = "https://api.cloudflare.com/client/v4"
 ONLINE_SEC = 180
 INACTIVE_DAYS = int(cfg("policy", "inactive_days", 60))
@@ -149,6 +165,7 @@ TZ = ZoneInfo(cfg("general", "timezone", "UTC"))
 BEGIN = "# >>> wgctl managed clients - do not edit by hand >>>"
 END = "# <<< wgctl managed clients <<<"
 NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,29}[a-z0-9])?$")   # like a DNS label: no trailing hyphen
+KEY_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,29}[a-z0-9])?$")   # key names may also have "_" (they are never host names)
 RESERVED = {PANEL_SUB, "www"} | set(cfg("network", "reserved_names", []))
 
 
@@ -176,6 +193,9 @@ def _check_config():
         bad.append("network.clients_from/clients_to (3..254)")
     if not _NETW.is_private:
         bad.append("network.subnet (private)")
+    spans = sorted(ROLE_IPS.values())
+    if any(not IP_MIN <= lo <= hi <= IP_MAX for lo, hi in spans) or any(a[1] >= b[0] for a, b in zip(spans, spans[1:])):
+        bad.append("roles.admin/server/client (ranges inside clients_from..clients_to, no overlap)")
     if any(c in BRAND for c in '"\\\n\r<>'):
         bad.append("panel.brand")
     if bad:
@@ -184,6 +204,7 @@ def _check_config():
 
 if CFG:
     _check_config()
+ROLE_UA = {"admin": T("адмін"), "server": T("сервер"), "client": T("клієнт")}
 STATUS_UA = {"active": T("активний"), "disabled": T("вимкнений"), "revoked": T("відкликаний")}
 REASON_UA = {"manual": T("вручну"), "expired": T("минув термін"), "suspicious": T("підозріла активність"), "": ""}
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -411,7 +432,42 @@ def load():
         l.setdefault("sites", [])
         l.setdefault("networks", [])
         l.setdefault("title", "")
+    for n, c in st["clients"].items():          # keys from before roles: admin, a device that hosts something, or client
+        if c.get("role") not in ROLES:
+            c["role"] = "admin" if c.get("admin") else "server" if hosted_on(st, n) else "client"
+        c["admin"] = c["role"] == "admin"
     return st
+
+
+def hosted_on(st, name):
+    """Sites and TCP services whose backend is this key's device."""
+    c = st["clients"][name]
+    out = [n for n, s in sorted(st["sites"].items()) if site_host(st, s) == ("client", name)]
+    out += [n for n, sv in sorted(st.get("services", {}).items()) if sv.get("target") == c["ip"]]
+    return out
+
+
+def role_range(role):
+    return ROLE_IPS[role]
+
+
+def in_role_range(c):
+    lo, hi = role_range(c["role"])
+    return lo <= octet(c["ip"]) <= hi
+
+
+def free_ip(st, role):
+    lo, hi = role_range(role)
+    used = used_octets(st)
+    free = [i for i in range(lo, hi + 1) if i not in used]
+    if not free:
+        die(T("У діапазоні ролі {0} ({1}{2}-{3}) вільних адрес немає", ROLE_UA[role], NET, lo, hi))
+    return free[0]
+
+
+def check_all_sites(role, sites):
+    if sites == "*" and role != "admin":
+        die(T("«Усі сайти» (*) лише для ролі адмін. Для {0} вкажіть сайти списком", ROLE_UA[role]))
 
 
 def save(st):
@@ -764,6 +820,7 @@ def client_view(name, c, peers, rdays=ROTATE_DEFAULT):
         "created": c["created"], "note": c.get("note", ""), "expires": c.get("expires"),
         "autorevoke": c.get("autorevoke", True), "autorevoke_in_days": left,
         "admin": c.get("admin", False), "sites": c.get("sites", []), "except": c.get("except", []),
+        "role": c.get("role", "client"), "role_ok": in_role_range(c) if c.get("role") in ROLES else True,
         "conf_file": f"{CONF_DIR}/{name}.conf" if c.get("conf") else None,
         "suspect": c.get("suspect", ""), "suspect_at": c.get("suspect_at", 0),
         "endpoints": c.get("endpoints", [])[-50:], "revoked_at": c.get("revoked_at", 0),
@@ -811,10 +868,25 @@ def used_octets(st):
     return used
 
 
+def pick_ip(st, role, want=None):
+    """A free address in the role's range (or the one asked for, if it is free and in that range)."""
+    if not want:
+        return free_ip(st, role)
+    lo, hi = role_range(role)
+    if not lo <= want <= hi or want in used_octets(st):
+        die(T("Адреса {0}{1} недоступна: для ролі {2} вільні адреси з {0}{3}-{4}", NET, want, ROLE_UA[role], lo, hi))
+    return want
+
+
 def cmd_add(a):
     name = a.name
-    if not NAME_RE.match(name):
-        die(T("Ім'я: малі латинські літери, цифри і дефіс, до 31 символу"))
+    if not KEY_RE.match(name):
+        die(T("Ім'я: малі латинські літери, цифри, дефіс і _, до 31 символу"))
+    role = a.role or ("admin" if a.admin else "client")
+    if a.admin and role != "admin":
+        die(T("Доступ до панелі мають лише ключі з роллю адмін"))
+    if a.hours is not None and role != "client":
+        die(T("Гостьовий ключ завжди має роль клієнт"))
     if a.hours is not None:
         if not 1 <= a.hours <= GUEST_MAX_HOURS:
             die(T("Гостьовий доступ: від 1 до {0} год", GUEST_MAX_HOURS))
@@ -827,27 +899,20 @@ def cmd_add(a):
             die(T("Клієнт {0} вже існує ({1})", name, STATUS_UA[old['status']]))
         if name in st["locations"]:
             die(T("{0} зайняте локацією", name))
-        used = used_octets(st)
-        if a.ip:
-            if not IP_MIN <= a.ip <= IP_MAX or a.ip in used:
-                die(T("Адреса {0}{1} недоступна (вільні {2}-{3})", NET, a.ip, IP_MIN, IP_MAX))
-            n = a.ip
-        else:
-            free = [i for i in range(IP_MIN, IP_MAX + 1) if i not in used]
-            if not free:
-                die(T("Вільних адрес немає"))
-            n = free[0]
+        n = pick_ip(st, role, a.ip)
         ip = f"{NET}{n}"
         priv, pub, psk = genkeys()
         sites = parse_sites(st, a.sites)
+        check_all_sites(role, sites)
         phone = clean_phone(a.phone)
         if phone and not PHONE_RE.match(phone):
             die(T("Телефон у міжнародному форматі, напр. +380671234567"))
         guest = {}
         if a.hours:
             guest = dict(guest_until=now() + a.hours * 3600, guest_hours=a.hours, autorevoke=False, expires=None)
-        kw = dict(note=clean_note(a.note), expires=parse_date(a.expires), autorevoke=not a.no_autorevoke,
-                  admin=a.admin, sites=sites if sites is not None else [], conf=True, phone=phone, rotated=now())
+        kw = dict(note=clean_note(a.note), expires=parse_date(a.expires),
+                  autorevoke=not a.no_autorevoke and role != "server",       # a server is online by design
+                  admin=role == "admin", role=role, sites=sites if sites is not None else [], conf=True, phone=phone, rotated=now())
         kw.update(guest)
         st["clients"][name] = new_client(ip, pub, psk, **kw)
         write_file(f"{CONF_DIR}/{name}.conf", client_conf(priv, ip, psk))
@@ -855,7 +920,7 @@ def cmd_add(a):
         apply(st)
     notify(T("Видано {0}доступ: {1} ({2})", T("гостьовий ") if a.hours else '', name, ip)
            + (T(" на {0} год, до {1}", a.hours, fmt_ts(now() + a.hours * 3600)[11:]) if a.hours else ""), "access", name)
-    print(T("Клієнт {0} -> {1} створено. Сайти: {2}", name, ip, sites_str(st['clients'][name]['sites'])))
+    print(T("Клієнт {0} -> {1} ({2}) створено. Сайти: {3}", name, ip, ROLE_UA[role], sites_str(st['clients'][name]['sites'])))
     print(T("Конфіг: {0}/{1}.conf", CONF_DIR, name))
     if a.qr:
         qr(f"{CONF_DIR}/{name}.conf")
@@ -912,17 +977,19 @@ def cmd_list(a):
     if not views:
         print(T("Клієнтів немає. Додати: wgctl add <ім'я>"))
         return
-    rows = [(T("ІМ'Я"), "IP", T("СТАТУС"), T("ЗВ'ЯЗОК"), T("ОСТАННЄ ПІДКЛ."), T("ЗВІДКИ"), T("ТРАФІК"), T("САЙТИ"), T("УВАГА"), T("ПРИМІТКА"))]
+    rows = [(T("ІМ'Я"), "IP", T("РОЛЬ"), T("СТАТУС"), T("ЗВ'ЯЗОК"), T("ОСТАННЄ ПІДКЛ."), T("ЗВІДКИ"), T("ТРАФІК"), T("САЙТИ"), T("УВАГА"), T("ПРИМІТКА"))]
     for v in views:
-        status = STATUS_UA[v["status"]] + (T(" (адмін)") if v["admin"] else "")
+        status = STATUS_UA[v["status"]]
         link = "-" if v["status"] == "revoked" else (T("онлайн") if v["online"] else T("офлайн"))
         traffic = f"{human(v['rx'])}/{human(v['tx'])}" if v["rx"] or v["tx"] else "-"
         warn = (T("підозра") if v["suspect"] else T("гість {0}", hm(v['guest_left'])) if v["guest"] else
                 T("< 7 дн") if v["autorevoke_in_days"] is not None and v["autorevoke_in_days"] <= WARN_DAYS else
-                T("змінити ключ") if v["rotate_due"] else "")
+                T("змінити ключ") if v["rotate_due"] else
+                T("адреса поза роллю") if not v["role_ok"] and v["status"] != "revoked" else
+                T("«*» не для ролі") if v["sites"] == "*" and v["role"] != "admin" else "")
         g = v["geo"]
         where = " ".join(x for x in (g.get("cc", ""), g.get("city", "")) if x) or (g.get("ip") or "-")
-        rows.append((v["name"], v["ip"], status, link, ago(v["last_seen"]), where, traffic,
+        rows.append((v["name"], v["ip"], ROLE_UA.get(v["role"], v["role"]), status, link, ago(v["last_seen"]), where, traffic,
                      sites_str(v["sites"], v.get("except")), warn, v["note"]))
     table(rows)
 
@@ -938,6 +1005,9 @@ def cmd_show(a):
     reason = f" ({REASON_UA.get(v['disabled_reason'], v['disabled_reason'])})" if v["disabled_reason"] else ""
     print(T("Ім'я:             {0}{1}", v['name'], T("  [адмін]") if v['admin'] else ''))
     print(T("Адреса:           {0}", v['ip']))
+    lo, hi = role_range(v["role"])
+    print(T("Роль:             {0} (адреси {1}{2}-{3}){4}", ROLE_UA[v["role"]], NET, lo, hi,
+            "" if v["role_ok"] else T("  поза діапазоном: wgctl move {0}", v["name"])))
     print(T("Статус:           {0}{1}", STATUS_UA[v['status']], reason))
     print(T("Зв'язок:          {0}", T("онлайн") if v['online'] else T("офлайн")))
     print(T("Останнє підкл.:   {0} ({1})", fmt_ts(v['last_seen']), ago(v['last_seen'])))
@@ -1021,6 +1091,85 @@ def cmd_revoke(a):
     change_status(a.name, "revoked", "", T("Доступ відкликано"), icon="🗑")
 
 
+def cmd_move(a):
+    """New address for a key, by default the first free one in its role's range. The keys stay; sites and
+    TCP services hosted on the device follow it. The device only needs the new Address line."""
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        if c["status"] == "revoked":
+            die(T("{0} відкликано", a.name))
+        old = c["ip"]
+        new = f"{NET}{pick_ip(st, c['role'], a.ip)}"
+        moved = []
+        for sn, site in sorted(st["sites"].items()):
+            if site_host(st, site) == ("client", a.name):
+                site["backend"] = re.sub(r"^(https?://)" + re.escape(old) + r"(?=[:/]|$)", lambda m: m.group(1) + new, site["backend"])
+                moved.append(sn)
+        for vn, sv in sorted(st.get("services", {}).items()):
+            if sv.get("target") == old:
+                sv["target"], sv["health"] = new, {}
+                moved.append(vn)
+        c["ip"] = new
+        path = f"{CONF_DIR}/{a.name}.conf"
+        if os.path.exists(path):
+            with open(path) as f:
+                conf = f.read()
+            write_file(path, re.sub(r"^Address = .*$", f"Address = {new}/32", conf, count=1, flags=re.M))
+        save(st)
+        apply(st)
+    notify(T("Нова адреса {0}: {1} -> {2}", a.name, old, new) + (T(" (переїхали: {0})", ", ".join(moved)) if moved else ""), "access", a.name)
+    print(T("{0}: {1} -> {2}", a.name, old, new))
+    if moved:
+        print(T("Бекенди переведено на нову адресу: {0}", ", ".join(moved)))
+    print(T("На пристрої змініть у конфігу WireGuard рядок Address = {0}/32 (або імпортуйте конфіг заново: wgctl conf {1}).\n"
+            "Доки цього не зроблено, пристрій без зв'язку.", new, a.name))
+
+
+def cmd_rename(a):
+    """Another name for a key: keys, address and config stay the same, nothing changes on the device."""
+    if not KEY_RE.match(a.new):
+        die(T("Ім'я: малі латинські літери, цифри, дефіс і _, до 31 символу"))
+    with Lock():
+        st = load()
+        c = get_client(st, a.name)
+        if c["status"] == "revoked":
+            die(T("{0} відкликано", a.name))
+        if a.new == a.name:
+            die(T("Це те саме ім'я"))
+        if a.new in st["locations"]:
+            die(T("{0} зайняте локацією", a.new))
+        other = st["clients"].get(a.new)
+        if other and other["status"] != "revoked":
+            die(T("Клієнт {0} вже існує ({1})", a.new, STATUS_UA[other['status']]))
+        st["clients"] = {(a.new if k == a.name else k): v for k, v in st["clients"].items() if k != a.new}
+        for sv in st.get("services", {}).values():
+            sv["allow"] = sorted(a.new if x == a.name else x for x in sv.get("allow", []))
+        old_conf, new_conf = f"{CONF_DIR}/{a.name}.conf", f"{CONF_DIR}/{a.new}.conf"
+        if os.path.exists(old_conf):
+            os.replace(old_conf, new_conf)
+        save(st)
+        apply(st)
+        rename_history(a.name, a.new)
+    notify(T("Перейменовано ключ: {0} -> {1}", a.name, a.new), "access", a.new)
+    print(T("{0} тепер {1}. На пристрої нічого міняти не треба.", a.name, a.new))
+
+
+def rename_history(old, new):
+    """Charts and visit counts follow the new name (best effort)."""
+    try:
+        if os.path.exists(HISTORY_DB):
+            db = hist_db()
+            for d in ("rx", "tx", "on"):
+                for tbl in ("m", "h", "last"):
+                    db.execute(f"UPDATE OR IGNORE {tbl} SET k = ? WHERE k = ?", (f"{d}:{new}", f"{d}:{old}"))
+            db.execute("UPDATE OR IGNORE visits SET who = ? WHERE who = ?", (new, old))
+            db.commit()
+            db.close()
+    except Exception as ex:
+        log(f"history rename: {ex!r}")
+
+
 def cmd_extend(a):
     with Lock():
         st = load()
@@ -1099,6 +1248,7 @@ def cmd_set(a):
     with Lock():
         st = load()
         c = get_client(st, a.name)
+        was_admin = c["admin"]
         given = False                     # the panel sends every field: only real changes go to the log
         if a.note is not None:
             given = True
@@ -1117,13 +1267,28 @@ def cmd_set(a):
             if onoff(a.autorevoke) != c.get("autorevoke", True):
                 c["autorevoke"] = onoff(a.autorevoke)
                 msgs.append(T("автовідкликання: {0}", T("так") if c['autorevoke'] else T("ні")))
-        if a.admin is not None:
-            if onoff(a.admin) and c.get("guest_until"):
-                die(T("Гостьовому ключу не можна давати доступ до панелі"))
-            c["admin"] = onoff(a.admin)
-            msgs.append(T("адмін: {0}", T("так") if c['admin'] else T("ні")))
+        role = a.role
+        if a.admin is not None:                    # panel access is the admin role
+            if a.role and (a.role == "admin") != onoff(a.admin):
+                die(T("Доступ до панелі мають лише ключі з роллю адмін"))
+            role = "admin" if onoff(a.admin) else (c["role"] if c["role"] != "admin" else "client")
+        if role and role != c["role"]:
+            if c.get("guest_until") and role != "client":
+                die(T("Гостьовий ключ завжди має роль клієнт"))
+            new_sites = parse_sites(st, a.sites) if a.sites is not None else c.get("sites")
+            if new_sites == "*" and role != "admin":
+                die(T("У {0} зараз «усі сайти». Для ролі {1} задайте список: --role {2} --sites сайт1,сайт2 (або none)", a.name, ROLE_UA[role], role))
+            c["role"], c["admin"] = role, role == "admin"
+            if role == "server" and c.get("autorevoke", True) and a.autorevoke is None:
+                c["autorevoke"] = False
+                msgs.append(T("автовідкликання: {0}", T("ні")))
+            msgs.append(T("роль: {0}", ROLE_UA[role]))
+            if a.admin is not None:
+                msgs.append(T("адмін: {0}", T("так") if c['admin'] else T("ні")))
         if a.sites is not None:
             new = parse_sites(st, a.sites)
+            if new == "*" and c.get("sites") != "*":
+                check_all_sites(c["role"], new)
             if not (new == "*" and c.get("sites") == "*"):
                 c.pop("except", None)              # a new list replaces the exceptions too
             c["sites"] = new
@@ -1145,17 +1310,20 @@ def cmd_set(a):
                 c["notes"] = nt
                 msgs.append(T("нотатки"))
         if not msgs:
-            if given or a.admin is not None or a.sites is not None:
+            if given or a.admin is not None or a.sites is not None or a.role is not None:
                 print(T("{0}: без змін", a.name))
                 return
             die(T("Нічого не змінено. Див. wgctl set -h"))
         save(st)
         apply(st, wg=False)
-    if a.admin is not None:
+    if (a.admin is not None or a.role) and was_admin != c["admin"]:
         notify(T("{0} доступ до панелі: {1}", T("Надано") if c['admin'] else T("Забрано"), a.name), "security", a.name,
                level="critical" if c["admin"] else "warning", icon="👑")
     log(T("EVENT:info Змінено {0}: ", a.name) + "; ".join(msgs))
     print(f"{a.name}: " + "; ".join(msgs))
+    if not in_role_range(c):
+        lo, hi = role_range(c["role"])
+        print(T("Адреса {0} поза діапазоном ролі {1} ({2}{3}-{4}). Перенести: wgctl move {5}", c["ip"], ROLE_UA[c["role"]], NET, lo, hi, a.name))
 
 
 def cmd_grant(a, revoke=False):
@@ -1467,7 +1635,7 @@ def topology(st, peers):
             state = "idle"
         elif state == "idle" and online:
             state = "ok"
-        devices.append({"name": n, "state": state, "online": online,
+        devices.append({"name": n, "state": state, "online": online, "role": c.get("role", "client"),
                         "sites": groups["client"].get(n, [])})
     return {"locations": {n: groups["location"].get(n, []) for n in st["locations"]},
             "vps": groups["vps"], "other": groups["other"], "devices": devices}
@@ -3755,7 +3923,7 @@ def cmd_log(a):
 
 
 # ---- first setup ------------------------------------------------------------
-CONFIG_TEMPLATE = T("# wgctl / vpnadmin: налаштування хаба. Після змін: sudo wgctl render && sudo systemctl restart vpnadmin\n[general]\nlanguage = \"{{language}}\"          # uk | en: CLI, сповіщення і типова мова панелі\ntimezone = \"{{timezone}}\"\n\n[network]\ndomain = \"{{domain}}\"              # сайти стануть ім'я.{{domain}}\npublic_ip = \"{{public_ip}}\"        # публічна адреса VPS\nendpoint_host = \"{{endpoint_host}}\"  # що писати в конфіги клієнтів (IP або DNS-ім'я)\nlisten_port = {{listen_port}}\nsubnet = \"{{subnet}}\"              # /24: .1 хаб, локації з locations_from по locations_to, клієнти з clients_from по clients_to\nlocations_from = 2\nlocations_to = 9\nclients_from = {{clients_from}}\nclients_to = {{clients_to}}\ninterface = \"wg0\"\nreserved_names = []              # імена, які не можна дати сайтам (напр. зайняті іншими записами DNS)\n\n[panel]\nsubdomain = \"vpnadmin\"           # панель: vpnadmin.{{domain}}\nbrand = \"{{brand}}\"                # назва в шапці панелі та в сповіщеннях\n\n[policy]\ninactive_days = 60               # автовідкликання після стількох днів без підключень\nwarn_days = 7\nguest_max_hours = 72\nrotate_days = 180                # нагадувати змінити ключ (0 = ні)\n\n[update]\nrepo = \"Hyrol7/wgctl-hub\"        # звідки sudo wgctl-update бере релізи\n")
+CONFIG_TEMPLATE = T("# wgctl / vpnadmin: налаштування хаба. Після змін: sudo wgctl render && sudo systemctl restart vpnadmin\n[general]\nlanguage = \"{{language}}\"          # uk | en: CLI, сповіщення і типова мова панелі\ntimezone = \"{{timezone}}\"\n\n[network]\ndomain = \"{{domain}}\"              # сайти стануть ім'я.{{domain}}\npublic_ip = \"{{public_ip}}\"        # публічна адреса VPS\nendpoint_host = \"{{endpoint_host}}\"  # що писати в конфіги клієнтів (IP або DNS-ім'я)\nlisten_port = {{listen_port}}\nsubnet = \"{{subnet}}\"              # /24: .1 хаб, локації з locations_from по locations_to, клієнти з clients_from по clients_to\nlocations_from = 2\nlocations_to = 9\nclients_from = {{clients_from}}\nclients_to = {{clients_to}}\ninterface = \"wg0\"\nreserved_names = []              # імена, які не можна дати сайтам (напр. зайняті іншими записами DNS)\n\n# Ролі ключів і їхні адреси (у межах clients_from..clients_to). Типово:\n# [roles]\n# admin = \"10-19\"                # ваші пристрої: панель, SSH, усі сайти\n# server = \"20-50\"               # пристрої, на яких працюють сайти\n# client = \"51-250\"              # люди й чужі комп'ютери, гості\n\n[panel]\nsubdomain = \"vpnadmin\"           # панель: vpnadmin.{{domain}}\nbrand = \"{{brand}}\"                # назва в шапці панелі та в сповіщеннях\n\n[policy]\ninactive_days = 60               # автовідкликання після стількох днів без підключень\nwarn_days = 7\nguest_max_hours = 72\nrotate_days = 180                # нагадувати змінити ключ (0 = ні)\n\n[update]\nrepo = \"Hyrol7/wgctl-hub\"        # звідки sudo wgctl-update бере релізи\n")
 
 
 def detect_public_ip():
@@ -4064,7 +4232,7 @@ def cmd_location(a):
 # Commands that change the system beyond VPN state (init, tcp setup, backup init/restore/verify, location adopt,
 # panel, cloudflare, geo update, render, monitor) are available from a terminal only.
 PANEL_USER = "vpnadmin"
-PANEL_CMDS = {"status", "list", "show", "log", "conf", "qr", "server", "config", "history", "visits",
+PANEL_CMDS = {"status", "list", "show", "move", "rename", "log", "conf", "qr", "server", "config", "history", "visits",
               "add", "reissue", "disable", "enable", "extend", "revoke", "trust", "clear", "set", "grant", "deny", "event"}
 PANEL_SUBCMDS = {"location": {"add", "set", "rm", "list", "conf", "reissue"}, "site": {"add", "set", "rm", "list"}, "tcp": {"add", "set", "rm", "allow", "deny", "list"},
              "notify": {"show", "set", "test", "groups", "create-group"}, "backup": {"run", "status"}}
@@ -4088,11 +4256,22 @@ def main():
     p.add_argument("--sites", help=T("сайти через кому, * = усі (включно з майбутніми); за замовчуванням жодного"))
     p.add_argument("--expires", help=T("термін дії РРРР-ММ-ДД"))
     p.add_argument("--no-autorevoke", action="store_true", help=T("не відкликати за неактивність"))
-    p.add_argument("--admin", action="store_true", help=T("доступ до панелі"))
+    p.add_argument("--admin", action="store_true", help=T("доступ до панелі (= роль адмін)"))
+    p.add_argument("--role", choices=ROLES, help=T("admin | server | client (типово client; --admin = admin)"))
     p.add_argument("--phone", help="+15551234567")
     p.add_argument("--hours", type=int, help=T("гостьовий ключ на 1-{0} год, потім відкличеться сам", GUEST_MAX_HOURS))
     p.add_argument("--qr", action="store_true", help=T("показати QR у терміналі"))
     p.set_defaults(f=cmd_add)
+
+    p = sp.add_parser("move", help=T("нова адреса ключа в діапазоні його ролі; сайти на пристрої переїжджають теж"))
+    p.add_argument("name")
+    p.add_argument("--ip", type=int, help=T("номер адреси (типово перша вільна в діапазоні ролі)"))
+    p.set_defaults(f=cmd_move)
+
+    p = sp.add_parser("rename", help=T("перейменувати ключ (ключі й адреса лишаються)"))
+    p.add_argument("name")
+    p.add_argument("new")
+    p.set_defaults(f=cmd_rename)
 
     p = sp.add_parser("reissue", help=T("нові ключі для клієнта, старий конфіг перестає працювати"))
     p.add_argument("name")
@@ -4156,6 +4335,7 @@ def main():
     p.add_argument("--expires", help=T("РРРР-ММ-ДД або none"))
     p.add_argument("--autorevoke", help="on/off")
     p.add_argument("--admin", help="on/off")
+    p.add_argument("--role", choices=ROLES, help=T("admin | server | client; адреса не змінюється (wgctl move)"))
     p.add_argument("--sites", help=T("список через кому, * або none"))
     p.add_argument("--phone", help=T("+380XXXXXXXXX або none"))
     p.add_argument("--notes", help=T("довгі нотатки"))

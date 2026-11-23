@@ -2,6 +2,11 @@
 
 ## 1.1.0
 
+- Key roles: `admin` (panel, SSH, may have all sites), `server` (hosts sites, no auto-revoke) and `client` (explicit sites only, guests). Each role has its own address range, by default `.10–.19`, `.20–.50` and `.51–.250` (`[roles]` in `config.toml`); new keys get an address from their range. `wgctl add/set --role`; `--admin` is the admin role. `*` (all sites) is now for admin keys only. Existing keys get a role automatically.
+- `wgctl move NAME [--ip N]`: a new address in the role's range; sites and TCP services hosted on the device follow it.
+- `wgctl rename NAME NEW`: keys, address and config stay; history and TCP permissions follow the new name.
+- Key names may contain `_` (`macbook_m2`); site and location names stay DNS labels.
+- Panel: role on key cards and in Overview filters, a role choice when issuing a key, a "Role and name" section on the key page (change role, move, rename), role-coloured device rings and a legend on the map.
 - `wgctl ssh`: SSH to the hub follows panel access. `sudo wgctl ssh setup` replaces the world-open SSH rule in `/etc/nftables.conf` (or a hand-written one) with the chain `wgctl_ssh`, which wgctl keeps equal to the panel list (admin keys, locations with `--panel on`) plus `wgctl ssh allow` extras. Refuses to cut off the current session or leave nobody allowed; `wgctl ssh off` reverts.
 
 ## 1.0.1

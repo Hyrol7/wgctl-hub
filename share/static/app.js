@@ -7,6 +7,8 @@ if(b){b.classList.add('busy');}setTimeout(function(){delete f.dataset.busy;if(b)
 /* key and site names: capitals, spaces and _ are converted as you type */
 document.querySelectorAll('input[data-name]').forEach(function(i){i.addEventListener('input',function(){
 var p=i.selectionStart,v=i.value.toLowerCase().replace(/[\s_.]+/g,'-');if(v!==i.value){i.value=v;i.setSelectionRange(p,p);}});});
+document.querySelectorAll('input[data-key]').forEach(function(i){i.addEventListener('input',function(){
+var p=i.selectionStart,v=i.value.toLowerCase().replace(/[\s.]+/g,'-');if(v!==i.value){i.value=v;i.setSelectionRange(p,p);}});});
 if(document.body.getAttribute('data-refresh')){var t0=Date.now(),k='vpnadmin-act';
 try{var v=+sessionStorage.getItem(k);if(v&&!performance.getEntriesByType('navigation').some(function(n){return n.type!=='reload'}))t0=v;}catch(e){}
 /* human actions only; scroll does not count, the browser scrolls by itself after a reload */

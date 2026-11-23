@@ -45,11 +45,11 @@ def test_setup_replaces_open_rule_and_follows_admin_flag(hub_en):
     assert "jump wgctl_ssh" in conf and "\n        tcp dport 22 accept" not in conf
     assert 'include "/etc/nftables.d/wgctl-ssh.nft"' in conf
     chain = hub_en.read("/etc/nftables.d/wgctl-ssh.nft")
-    assert "10.77.0.10" in chain and "10.77.0.11" not in chain and 'iifname "wg0"' in chain
+    assert "10.77.0.10" in chain and "10.77.0.51" not in chain and 'iifname "wg0"' in chain
     hub_en.run("set", "tv", "--admin", "on")
-    assert "10.77.0.11" in hub_en.read("/etc/nftables.d/wgctl-ssh.nft")
+    assert "10.77.0.51" in hub_en.read("/etc/nftables.d/wgctl-ssh.nft")
     hub_en.run("set", "tv", "--admin", "off")
-    assert "10.77.0.11" not in hub_en.read("/etc/nftables.d/wgctl-ssh.nft")
+    assert "10.77.0.51" not in hub_en.read("/etc/nftables.d/wgctl-ssh.nft")
 
 
 def test_setup_migrates_hand_written_rule(hub_en):
