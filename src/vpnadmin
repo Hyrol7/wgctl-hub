@@ -1868,10 +1868,16 @@ class H(http.server.BaseHTTPRequestHandler):
         for c in clients:
             if c["status"] == "revoked":
                 continue
-            cands.append(c["name"])
             off = T(" (вимкнений)") if c["status"] != "active" else ""
+            if sv.get("admins") and c.get("role") == "admin":      # always allowed: shown, not editable
+                togs.append(f'<label class="tog"><input type="checkbox" checked disabled><span>{e(c["name"])}{off}{T(" (адмін)")}</span></label>')
+                continue
+            cands.append(c["name"])
             togs.append(f'<label class="tog"><input type="checkbox" name="who" value="{c["name"]}"'
                         f'{" checked" if c["name"] in sv["allow"] else ""}><span>{e(c["name"])}{off}</span></label>')
+        if sv.get("admins"):
+            togs.insert(0, T("<p class=\"hint\">Усі ключі з роллю адмін мають доступ автоматично{0}.</p>",
+                             T(" (SSH для адмінів ключа {0})", e(sv["auto"])) if sv.get("auto") else ""))
         ready = "" if tcp["ready"] else (T("<div class=\"note warn\">Сервіс ще не працює: виконайте один раз на VPS <span class=\"mono\">sudo wgctl tcp setup</span>.</div>"))
         body = T("{0}<section><h2>Як підключитися</h2><div class=\"panel\"><p class=\"mono\">{1}</p>\n<p class=\"hint\">Працює лише з пристроїв, яким нижче дано доступ, і лише через VPN. Ціль бачить підключення від {2}.</p></div></section>\n<section><h2>Доступ</h2><div class=\"panel\"><form method=\"post\">{3}<input type=\"hidden\" name=\"act\" value=\"access\">\n<input type=\"hidden\" name=\"cand\" value=\"{4}\"><div class=\"togs\">{5}</div>\n<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>\n{6}\n<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{7}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"ti\">Адреса цілі</label><input type=\"text\" id=\"ti\" name=\"target\" value=\"{8}\" required></div>\n<div><label class=\"f\" for=\"tp\">Порт цілі</label><input type=\"text\" id=\"tp\" name=\"tport\" value=\"{9}\" inputmode=\"numeric\" required></div></div>\n<label class=\"f\" for=\"tnt\">Примітка</label><input type=\"text\" id=\"tnt\" name=\"note\" maxlength=\"80\" value=\"{10}\">\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form>\n<div class=\"row\">{11}</div></div></section>", ready, e(svc_howto(sv)), HUB_IP, cs, ','.join(cands), ''.join(togs) or T("<p class=\"muted\">Ключів ще немає.</p>"), self.availability(f"/t/{name}", name), cs, e(sv['target']), sv['target_port'], e(sv.get('note') or ''), self.bform(s, "delete", T("Видалити сервіс"), "btn danger", T("Видалити {0}? Доступ до нього зникне в усіх.", sv['name'])))
         return self.layout(s, sv["name"], hero, body, "sites", state)

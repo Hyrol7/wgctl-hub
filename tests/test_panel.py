@@ -250,3 +250,16 @@ def test_underscore_key_on_site_and_log_pages(panel):
     assert "nas" in panel.hub.state()["clients"]["macbook_m2"]["sites"]
     st, _, t, _ = c.req("GET", "/log?client=macbook_m2")
     assert st == 200 and "Traceback" not in t
+
+
+def test_admin_ssh_service_page(panel):
+    panel.hub.run("add", "pi", "--role", "server")
+    panel.hub.run("add", "guest1")
+    panel.hub.run("set", "pi", "--ssh", "on")
+    c = Client(panel)
+    c.login()
+    st, _, body, _ = c.req("GET", "/t/pi-ssh")
+    assert st == 200
+    assert "All keys with the admin role have access automatically" in body
+    assert '<input type="checkbox" checked disabled><span>phone (admin)' in body
+    assert 'name="cand" value="pi,guest1"' in body or 'name="cand" value="guest1,pi"' in body

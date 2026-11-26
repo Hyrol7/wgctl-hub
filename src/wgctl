@@ -1060,6 +1060,8 @@ def change_status(name, status, reason, why, cat="access", user=None, icon=None)
             for sv in st.get("services", {}).values():
                 if name in sv.get("allow", []):
                     sv["allow"].remove(name)
+            if auto_ssh_of(st, name):
+                del st["services"][auto_ssh_of(st, name)]    # the address may go to another device later
         save(st)
         apply(st)
     notify(f"{why}: {name} ({c['ip']})", cat, name, user, icon=icon)
@@ -1145,6 +1147,8 @@ def cmd_rename(a):
         st["clients"] = {(a.new if k == a.name else k): v for k, v in st["clients"].items() if k != a.new}
         for sv in st.get("services", {}).values():
             sv["allow"] = sorted(a.new if x == a.name else x for x in sv.get("allow", []))
+            if sv.get("auto") == a.name:
+                sv["auto"] = a.new
         old_conf, new_conf = f"{CONF_DIR}/{a.name}.conf", f"{CONF_DIR}/{a.new}.conf"
         if os.path.exists(old_conf):
             os.replace(old_conf, new_conf)
@@ -1293,6 +1297,34 @@ def cmd_set(a):
                 c.pop("except", None)              # a new list replaces the exceptions too
             c["sites"] = new
             msgs.append(T("сайти: {0}", sites_str(c['sites'])))
+        auto = auto_ssh_of(st, a.name)
+        if auto and c["role"] != "server":                 # SSH for admins belongs to the server role only
+            del st["services"][auto]
+            msgs.append(T("SSH для адмінів: вимкнено ({0})", auto))
+            auto = None
+        if a.ssh is not None:
+            given = True
+            want = a.ssh if a.ssh.isdigit() and a.ssh not in ("0", "1") else ("22" if onoff(a.ssh) else "")
+            if want and c["role"] != "server":
+                die(T("SSH для адмінів можна ввімкнути лише ключу з роллю сервер: wgctl set {0} --role server --ssh on", a.name))
+            if want and not 1 <= int(want) <= 65535:
+                die(T("Порт SSH: 1-65535"))
+            if want and c["status"] == "revoked":
+                die(T("{0} відкликано", a.name))
+            svcs = st.setdefault("services", {})
+            if want and not auto:
+                auto = auto_ssh_name(a.name)
+                if auto in svcs or auto in st["sites"] or auto in RESERVED:
+                    die(T("Ім'я {0} вже зайняте сайтом або сервісом", auto))
+                svcs[auto] = {"target": c["ip"], "target_port": int(want), "port": free_port(st), "note": T("SSH для адмінів"),
+                              "allow": [], "admins": True, "auto": a.name, "created": now(), "health": {}}
+                msgs.append(T("SSH для адмінів: {0}.{1}:{2} -> {3}:{4}", auto, DOMAIN, svcs[auto]["port"], c["ip"], want))
+            elif want and svcs[auto]["target_port"] != int(want):
+                svcs[auto].update(target_port=int(want), health={})
+                msgs.append(T("SSH для адмінів: порт {0}", want))
+            elif not want and auto:
+                del svcs[auto]
+                msgs.append(T("SSH для адмінів: вимкнено ({0})", auto))
         if a.phone is not None:
             given = True
             ph = clean_phone(a.phone)
@@ -1310,7 +1342,7 @@ def cmd_set(a):
                 c["notes"] = nt
                 msgs.append(T("нотатки"))
         if not msgs:
-            if given or a.admin is not None or a.sites is not None or a.role is not None:
+            if given or a.admin is not None or a.sites is not None or a.role is not None or a.ssh is not None:
                 print(T("{0}: без змін", a.name))
                 return
             die(T("Нічого не змінено. Див. wgctl set -h"))
@@ -1321,6 +1353,8 @@ def cmd_set(a):
                level="critical" if c["admin"] else "warning", icon="👑")
     log(T("EVENT:info Змінено {0}: ", a.name) + "; ".join(msgs))
     print(f"{a.name}: " + "; ".join(msgs))
+    if auto_ssh_of(st, a.name) and not tcp_ready():
+        print(T("Увага: спершу виконайте разове налаштування: sudo wgctl tcp setup"))
     if not in_role_range(c):
         lo, hi = role_range(c["role"])
         print(T("Адреса {0} поза діапазоном ролі {1} ({2}{3}-{4}). Перенести: wgctl move {5}", c["ip"], ROLE_UA[c["role"]], NET, lo, hi, a.name))
@@ -2044,11 +2078,27 @@ def nft_conf_patched(text):
     return "\n".join(out) + "\n" if inc_done and jump_done else None
 
 
+def svc_allowed(st, sv):
+    """Keys that may use a service: its own list plus, with "admins", every key with the admin role (always current)."""
+    who = {n for n in sv.get("allow", []) if n in st["clients"] and st["clients"][n]["status"] != "revoked"}
+    if sv.get("admins"):
+        who |= {n for n, c in st["clients"].items() if c.get("role") == "admin" and c["status"] != "revoked"}
+    return sorted(who)
+
+
+def auto_ssh_name(key):
+    """Name of the SSH service that `wgctl set KEY --ssh on` creates: a DNS label, because it is also a host name."""
+    return re.sub(r"-+$", "", key.replace("_", "-")[:27]) + "-ssh"
+
+
+def auto_ssh_of(st, key):
+    return next((n for n, sv in st.get("services", {}).items() if sv.get("auto") == key), None)
+
+
 def render_tcp_nft(st):
     lines = [T("# Згенеровано wgctl. Не редагуйте вручну: зміни зітруться."), "table inet filter {", "\tchain wgctl_tcp {"]
     for name, sv in sorted(st.get("services", {}).items(), key=lambda x: x[1]["port"]):
-        ips = sorted({st["clients"][n]["ip"] for n in sv.get("allow", [])
-                      if n in st["clients"] and st["clients"][n]["status"] == "active"}, key=octet)
+        ips = sorted({st["clients"][n]["ip"] for n in svc_allowed(st, sv) if st["clients"][n]["status"] == "active"}, key=octet)
         if ips:
             lines.append(f'\t\tiifname "{IFACE}" ip saddr {{ {", ".join(ips)} }} tcp dport {sv["port"]} accept   # {name}')
     lines += ["\t}", "}"]
@@ -2429,10 +2479,15 @@ def cmd_tcp_add(a):
             die(T("Порт хаба: вільний з {0}-{1}", TCP_PORTS[0], TCP_PORTS[1]))
         svcs[name] = {"target": ip, "target_port": tport, "port": port, "note": clean_note(a.note),
                       "allow": [], "created": now(), "health": {}}
+        if a.admins and onoff(a.admins):
+            svcs[name]["admins"] = True
         save(st)
         apply_tcp(st)
     notify(T("Додано TCP-сервіс: {0} ({1}:{2} -> {3}:{4})", name, HUB_IP, port, ip, tport), "access")
-    print(T("Сервіс {0}: підключення {1}.{2}:{3} -> {4}:{5}. Доступ поки ні в кого: wgctl tcp allow {6} <ключ>", name, name, DOMAIN, port, ip, tport, name))
+    if svcs[name].get("admins"):
+        print(T("Сервіс {0}: підключення {1}.{2}:{3} -> {4}:{5}. Доступ мають усі ключі з роллю адмін.", name, name, DOMAIN, port, ip, tport))
+    else:
+        print(T("Сервіс {0}: підключення {1}.{2}:{3} -> {4}:{5}. Доступ поки ні в кого: wgctl tcp allow {6} <ключ>", name, name, DOMAIN, port, ip, tport, name))
     if not tcp_ready():
         print(T("Увага: спершу виконайте разове налаштування: sudo wgctl tcp setup"))
 
@@ -2447,8 +2502,17 @@ def cmd_tcp_set(a):
             sv["target"], sv["target_port"], sv["health"] = ip, tport, {}
         if a.note is not None:
             sv["note"] = clean_note(a.note)
+        if a.admins is not None:
+            if sv.get("auto") and not onoff(a.admins):
+                die(T("Сервіс {0} створено для адмінів ключа {1}. Вимкнути: wgctl set {1} --ssh off", a.name, sv["auto"]))
+            if onoff(a.admins):
+                sv["admins"] = True
+            else:
+                sv.pop("admins", None)
         save(st)
         apply_tcp(st)
+    if a.admins is not None:
+        notify(T("TCP-сервіс {0}: усі адміни {1}", a.name, T("мають доступ") if sv.get("admins") else T("більше не мають доступу автоматично")), "access")
     log(T("EVENT:info Змінено TCP-сервіс {0}: {1}:{2}", a.name, sv['target'], sv['target_port']))
     print(T("Сервіс {0} оновлено", a.name))
 
@@ -2495,8 +2559,9 @@ def services_view(st):
     out = []
     for name, sv in sorted(st.get("services", {}).items(), key=lambda x: x[1]["port"]):
         kind, where = site_host(st, {"backend": f"http://{sv['target']}"})
-        allow = [n for n in sv.get("allow", []) if n in st["clients"] and st["clients"][n]["status"] != "revoked"]
-        out.append({"name": name, "host": f"{name}.{DOMAIN}", **sv, "allow": allow, "on_kind": kind, "on": where,
+        out.append({"name": name, "host": f"{name}.{DOMAIN}", **sv, "allow": svc_allowed(st, sv),
+                    "own": [n for n in sv.get("allow", []) if n in st["clients"] and st["clients"][n]["status"] != "revoked"],
+                    "admins": bool(sv.get("admins")), "auto": sv.get("auto", ""), "on_kind": kind, "on": where,
                     "on_title": (st["locations"].get(where) or {}).get("title") or where if kind == "location" else "",
                     "kind": next((k for k, p in TCP_PRESETS.items() if p == sv["target_port"]), "tcp")})
     return out
@@ -2517,7 +2582,8 @@ def cmd_tcp_list(a):
     for s in out:
         h = s.get("health") or {}
         rows.append((s["name"], f"{s['host']}:{s['port']}", f"{s['target']}:{s['target_port']}",
-                     "-" if not h else (T("ok {0} мс", h['ms']) if h.get("ok") else T("не відповідає")), ", ".join(s["allow"]) or "-"))
+                     "-" if not h else (T("ok {0} мс", h['ms']) if h.get("ok") else T("не відповідає")),
+                     ", ".join(([T("усі адміни")] if s["admins"] else []) + s["own"]) or "-"))
     table(rows)
 
 
@@ -4339,6 +4405,7 @@ def main():
     p.add_argument("--sites", help=T("список через кому, * або none"))
     p.add_argument("--phone", help=T("+380XXXXXXXXX або none"))
     p.add_argument("--notes", help=T("довгі нотатки"))
+    p.add_argument("--ssh", help=T("on/off або порт: SSH на цей сервер для всіх ключів з роллю адмін (TCP-сервіс)"))
     p.set_defaults(f=cmd_set)
 
     p = sp.add_parser("panel", help=T("увімкнути/вимкнути вебпанель у Caddy"))
@@ -4418,11 +4485,13 @@ def main():
     p.add_argument("target", help=T("IP:порт цілі, напр. 192.168.1.20:22"))
     p.add_argument("--port", type=int, help=T("порт на хабі {0}-{1} (типово перший вільний)", TCP_PORTS[0], TCP_PORTS[1]))
     p.add_argument("--note")
+    p.add_argument("--admins", help=T("on/off: доступ для всіх ключів з роллю адмін"))
     p.set_defaults(f=cmd_tcp_add)
     p = tc.add_parser("set", help=T("змінити ціль чи примітку"))
     p.add_argument("name")
     p.add_argument("--target")
     p.add_argument("--note")
+    p.add_argument("--admins", help=T("on/off: доступ для всіх ключів з роллю адмін"))
     p.set_defaults(f=cmd_tcp_set)
     p = tc.add_parser("rm", help=T("видалити сервіс"))
     p.add_argument("name")
