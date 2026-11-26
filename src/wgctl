@@ -998,7 +998,10 @@ def cmd_show(a):
     st = load()
     v = client_view(a.name, get_client(st, a.name), dump(), rotate_days(st))
     v["services"] = [{"name": n, "port": sv["port"], "target": f"{sv['target']}:{sv['target_port']}"}
-                     for n, sv in sorted(st.get("services", {}).items()) if a.name in sv.get("allow", [])]
+                     for n, sv in sorted(st.get("services", {}).items()) if a.name in svc_allowed(st, sv)]
+    auto = auto_ssh_of(st, a.name)
+    v["ssh"] = ({"name": auto, "host": f"{auto}.{DOMAIN}", "port": st["services"][auto]["port"],
+                 "target_port": st["services"][auto]["target_port"]} if auto else None)
     if a.json:
         print(json.dumps(v, ensure_ascii=False))
         return

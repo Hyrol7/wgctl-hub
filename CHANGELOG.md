@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- SSH to servers for admins: `wgctl set KEY --ssh on|off|PORT` on a key with the server role creates the TCP service `KEY-ssh` to the device's own address, open to every key with the admin role (computed from roles, so new admins get in and former ones lose access at once). Removed when the key leaves the server role or is revoked; follows `move` and `rename`. Nothing is forwarded between keys.
+- SSH to servers for admins: `wgctl set KEY --ssh on|off|PORT` on a key with the server role creates the TCP service `KEY-ssh` to the device's own address, open to every key with the admin role (computed from roles, so new admins get in and former ones lose access at once). Removed when the key leaves the server role or is revoked; follows `move` and `rename`. Nothing is forwarded between keys. In the panel: an "SSH for admins" switch (with the port) on the page of a server key.
 - TCP services: `--admins on|off` on `wgctl tcp add/set` opens a service to all admin keys. The panel shows admin keys as always allowed on such services.
 
 ## 1.1.0

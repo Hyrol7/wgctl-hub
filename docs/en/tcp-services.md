@@ -44,6 +44,8 @@ sudo wgctl set raspberry-pi --ssh on        # or --ssh 2222 if sshd listens else
 ssh -p 2201 user@raspberry-pi-ssh.example.org
 ```
 
+In the panel, the "SSH for admins" switch on the page of a server-role key (section "Role and name") does the same.
+
 wgctl creates the service `<key>-ssh` with the target `key address:22`. Access is computed from roles every time: a new admin gets it at once, and a key that loses the admin role, is disabled or revoked loses it. The service goes away when the server stops being a server, is revoked, or with `--ssh off`; it survives `wgctl move` and `wgctl rename`. Traffic between keys is still never forwarded.
 
 Any other service can get the same "all admins" access: `wgctl tcp add nas-ssh 192.168.1.20:22 --admins on` or `wgctl tcp set nas-ssh --admins on|off`. Single keys (`wgctl tcp allow`) are added on top of the admins.
