@@ -250,3 +250,32 @@ def test_underscore_key_on_site_and_log_pages(panel):
     assert "nas" in panel.hub.state()["clients"]["macbook_m2"]["sites"]
     st, _, t, _ = c.req("GET", "/log?client=macbook_m2")
     assert st == 200 and "Traceback" not in t
+
+
+def test_admin_ssh_service_page(panel):
+    panel.hub.run("add", "pi", "--role", "server")
+    panel.hub.run("add", "guest1")
+    panel.hub.run("set", "pi", "--ssh", "on")
+    c = Client(panel)
+    c.login()
+    st, _, body, _ = c.req("GET", "/t/pi-ssh")
+    assert st == 200
+    assert "All keys with the admin role have access automatically" in body
+    assert '<input type="checkbox" checked disabled><span>phone (admin)' in body
+    assert 'name="cand" value="pi,guest1"' in body or 'name="cand" value="guest1,pi"' in body
+
+
+def test_server_ssh_toggle_on_key_page(panel):
+    panel.hub.run("add", "pi", "--role", "server")
+    c, tok = logged_in(panel)
+    st, _, body, _ = c.req("GET", "/c/pi")
+    assert "Turn on SSH for admins" in body
+    assert c.req("POST", "/c/pi", {"act": "ssh_on", "sport": "2222", "csrf": tok})[0] == 303
+    sv = panel.hub.state()["services"]["pi-ssh"]
+    assert (sv["target_port"], sv["admins"]) == (2222, True)
+    _, _, body, _ = c.req("GET", "/c/pi")
+    assert "Turn off SSH for admins" in body and "pi-ssh." in body
+    assert c.req("POST", "/c/pi", {"act": "ssh_off", "csrf": tok})[0] == 303
+    assert "pi-ssh" not in panel.hub.state()["services"]
+    _, _, body, _ = c.req("GET", "/c/phone")                  # an admin key has no such block
+    assert "<h3>SSH for admins" not in body

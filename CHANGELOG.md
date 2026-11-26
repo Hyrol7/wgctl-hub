@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- SSH to servers for admins: `wgctl set KEY --ssh on|off|PORT` on a key with the server role creates the TCP service `KEY-ssh` to the device's own address, open to every key with the admin role (computed from roles, so new admins get in and former ones lose access at once). Removed when the key leaves the server role or is revoked; follows `move` and `rename`. Nothing is forwarded between keys. In the panel: an "SSH for admins" switch (with the port) on the page of a server key.
+- TCP services: `--admins on|off` on `wgctl tcp add/set` opens a service to all admin keys. The panel shows admin keys as always allowed on such services.
+
 ## 1.1.0
 
 - Key roles: `admin` (panel, SSH, may have all sites), `server` (hosts sites, no auto-revoke) and `client` (explicit sites only, guests). Each role has its own address range, by default `.10–.19`, `.20–.50` and `.51–.250` (`[roles]` in `config.toml`); new keys get an address from their range. `wgctl add/set --role`; `--admin` is the admin role. `*` (all sites) is now for admin keys only. Existing keys get a role automatically.

@@ -1406,6 +1406,13 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.act(s, args, T("Збережено"))
             elif a == "sites":
                 self.act(s, ["set", name, "--sites", self.sites_value(f)], T("Права на сайти збережено"))
+            elif a in ("ssh_on", "ssh_off"):
+                port = str(f.get("sport", "")).strip() or "22"
+                if a == "ssh_on" and not (port.isdigit() and 1 < int(port) <= 65535):
+                    self.flash(s, "bad", T("Порт SSH: 1-65535"))
+                else:
+                    self.act(s, ["set", name, "--ssh", port if a == "ssh_on" else "off"],
+                             T("SSH для адмінів увімкнено") if a == "ssh_on" else T("SSH для адмінів вимкнено"))
             elif a == "role" and f.get("role") in ("client", "server"):
                 self.act(s, ["set", name, "--role", f["role"]], T("Роль змінено"))
             elif a == "move":
@@ -1542,8 +1549,20 @@ class H(http.server.BaseHTTPRequestHandler):
             opts = "".join(f'<label class="tog"><input type="radio" name="role" value="{r}"{" checked" if r == role else ""}><span>{e(ROLE_NAME[r])}</span></label>'
                            for r in ("client", "server"))
             out.append(T("<form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"role\"><div class=\"togs\">{1}</div><button class=\"btn\">Змінити роль</button></form>", cs, opts))
+        if role == "server":
+            out.append(self.ssh_block(c, cs))
         out.append(T("<form method=\"post\" class=\"row\">{0}<input type=\"hidden\" name=\"act\" value=\"rename\"><input type=\"text\" name=\"new\" required data-key maxlength=\"31\" autocapitalize=\"none\" autocomplete=\"off\" spellcheck=\"false\" pattern=\"{1}\" title=\"{2}\" placeholder=\"нове ім'я\" aria-label=\"Нове ім'я\"><button class=\"btn\">Перейменувати</button></form><p class=\"muted small\">Ключі й адреса лишаються, на пристрої нічого міняти не треба.</p>", cs, KEY_PATTERN, e(KEY_HINT)))
         return T("<section><h2>Роль і назва</h2><div class=\"panel\">{0}</div></section>", "".join(out))
+
+    @staticmethod
+    def ssh_block(c, cs):
+        """A server key: SSH to it for every admin key, through a TCP service on the hub."""
+        ssh = c.get("ssh")
+        if ssh:
+            how = T("ssh -p {0} користувач@{1}", ssh["port"], ssh["host"])
+            return T("<h3>SSH для адмінів</h3><p class=\"pstat on\">Увімкнено: усі ключі з роллю адмін можуть зайти на порт {0} цього пристрою.</p><p class=\"mono\">{1}</p>\n<form method=\"post\" class=\"row\">{2}<button class=\"btn\" name=\"act\" value=\"ssh_off\">Вимкнути SSH для адмінів</button></form>",
+                     ssh["target_port"], e(how), cs)
+        return T("<h3>SSH для адмінів</h3><p class=\"pstat off\">Вимкнено.</p><p class=\"muted small\">Усі ключі з роллю адмін зможуть заходити на цей пристрій по SSH через хаб. Трафік між ключами не пересилається.</p>\n<form method=\"post\" class=\"row\">{0}<input class=\"code\" type=\"text\" name=\"sport\" value=\"22\" inputmode=\"numeric\" maxlength=\"5\" aria-label=\"Порт SSH на пристрої\"><button class=\"btn pri\" name=\"act\" value=\"ssh_on\">Увімкнути SSH для адмінів</button></form>", cs)
 
     @staticmethod
     def conf_grace(s, name, c):
@@ -1868,10 +1887,16 @@ class H(http.server.BaseHTTPRequestHandler):
         for c in clients:
             if c["status"] == "revoked":
                 continue
-            cands.append(c["name"])
             off = T(" (вимкнений)") if c["status"] != "active" else ""
+            if sv.get("admins") and c.get("role") == "admin":      # always allowed: shown, not editable
+                togs.append(f'<label class="tog"><input type="checkbox" checked disabled><span>{e(c["name"])}{off}{T(" (адмін)")}</span></label>')
+                continue
+            cands.append(c["name"])
             togs.append(f'<label class="tog"><input type="checkbox" name="who" value="{c["name"]}"'
                         f'{" checked" if c["name"] in sv["allow"] else ""}><span>{e(c["name"])}{off}</span></label>')
+        if sv.get("admins"):
+            togs.insert(0, T("<p class=\"hint\">Усі ключі з роллю адмін мають доступ автоматично{0}.</p>",
+                             T(" (SSH для адмінів ключа {0})", e(sv["auto"])) if sv.get("auto") else ""))
         ready = "" if tcp["ready"] else (T("<div class=\"note warn\">Сервіс ще не працює: виконайте один раз на VPS <span class=\"mono\">sudo wgctl tcp setup</span>.</div>"))
         body = T("{0}<section><h2>Як підключитися</h2><div class=\"panel\"><p class=\"mono\">{1}</p>\n<p class=\"hint\">Працює лише з пристроїв, яким нижче дано доступ, і лише через VPN. Ціль бачить підключення від {2}.</p></div></section>\n<section><h2>Доступ</h2><div class=\"panel\"><form method=\"post\">{3}<input type=\"hidden\" name=\"act\" value=\"access\">\n<input type=\"hidden\" name=\"cand\" value=\"{4}\"><div class=\"togs\">{5}</div>\n<div class=\"row\"><button class=\"btn pri\">Зберегти доступ</button></div></form></div></section>\n{6}\n<section><h2>Налаштування</h2><div class=\"panel\"><form method=\"post\">{7}<input type=\"hidden\" name=\"act\" value=\"save\">\n<div class=\"g2\"><div><label class=\"f\" for=\"ti\">Адреса цілі</label><input type=\"text\" id=\"ti\" name=\"target\" value=\"{8}\" required></div>\n<div><label class=\"f\" for=\"tp\">Порт цілі</label><input type=\"text\" id=\"tp\" name=\"tport\" value=\"{9}\" inputmode=\"numeric\" required></div></div>\n<label class=\"f\" for=\"tnt\">Примітка</label><input type=\"text\" id=\"tnt\" name=\"note\" maxlength=\"80\" value=\"{10}\">\n<div class=\"row\"><button class=\"btn pri\">Зберегти</button></div></form>\n<div class=\"row\">{11}</div></div></section>", ready, e(svc_howto(sv)), HUB_IP, cs, ','.join(cands), ''.join(togs) or T("<p class=\"muted\">Ключів ще немає.</p>"), self.availability(f"/t/{name}", name), cs, e(sv['target']), sv['target_port'], e(sv.get('note') or ''), self.bform(s, "delete", T("Видалити сервіс"), "btn danger", T("Видалити {0}? Доступ до нього зникне в усіх.", sv['name'])))
         return self.layout(s, sv["name"], hero, body, "sites", state)
